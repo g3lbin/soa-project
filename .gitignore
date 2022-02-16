@@ -1,0 +1,9 @@
+## VSCODE ##
+.vscode/
+.vscode*
+
+## ECLIPSE ##
+.cproject/
+.project/
+.settings/
+Debug/
