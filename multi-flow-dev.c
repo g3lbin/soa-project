@@ -7,7 +7,8 @@
 #include <linux/sched.h>        
 #include <linux/pid.h>          /* For pid types */
 #include <linux/version.h>      /* For LINUX_VERSION_CODE */
-
+#include <linux/slab.h>
+#include <linux/mm.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Cristiano Cuffaro");
@@ -43,11 +44,14 @@ static int Major;            /* Major number assigned to broadcast device driver
 typedef struct _device_state {
     int disabled;
     int current_priority;
-    loff_t old_pos;
     struct mutex operation_synchronizer;
     int valid_bytes[PRIORITIES];
     char *streams[PRIORITIES];
 } device_state;
+
+typedef struct _device_data {
+    loff_t old_pos;
+} device_data;
 
 #define MINORS 128
 device_state devices[MINORS];
@@ -58,6 +62,7 @@ device_state devices[MINORS];
 
 static int dev_open(struct inode *inode, struct file *file)
 {
+    // int idx;
     device_state *dev;
     int minor = get_minor(file);
 
@@ -68,6 +73,15 @@ static int dev_open(struct inode *inode, struct file *file)
 
     if (dev->disabled)
         return -EACCES;
+
+    file->private_data = kzalloc(sizeof(device_data), GFP_KERNEL);
+	if (!file->private_data) {
+		return -ENOMEM;
+	}
+
+    // idx = dev->current_priority;
+    // file->f_pos = dev->valid_bytes[idx];
+    // ((device_data *)file->private_data)->old_pos = dev->valid_bytes[(idx+1)%PRIORITIES];
     
     // if(!try_module_get(THIS_MODULE))
     //     return -ENODEV;
@@ -81,6 +95,8 @@ static int dev_release(struct inode *inode, struct file *file)
 {
     int minor;
     minor = get_minor(file);
+
+    kfree(file->private_data);
 
     printk("%s: device file closed\n",MODNAME);
     // module_put(THIS_MODULE);
@@ -107,14 +123,11 @@ ssize_t dev_read(struct file *file, char *buf, size_t count, loff_t *pos)
     
     if((dev->valid_bytes[idx] - *pos) < count) count = dev->valid_bytes[idx] - *pos;
         ret = copy_to_user(buf,&(dev->streams[idx][*pos]), count);
-  
+
     *pos += (count - ret);
     mutex_unlock(&(dev->operation_synchronizer));
 
     return count - ret;
-    printk("%s: somebody called a read on dev with [major,minor] number [%d,%d]\n",MODNAME,get_major(file),get_minor(file));
-
-    return 0;
 }
 
 ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
@@ -152,11 +165,12 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
 
 static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    int ret;
     int minor = get_minor(file);
 
     device_state *dev;
     dev = devices + minor;
-    printk("%s: somebody called a ioctl on dev with [major,minor] number [%d,%d]\n",MODNAME,get_major(file),get_minor(file));
+    printk("%s: somebody called a ioctl on dev with [major,minor] number [%d,%d] and command %d\n",MODNAME,get_major(file),get_minor(file),cmd);
 
     mutex_lock(&(dev->operation_synchronizer));
     switch (cmd)
@@ -164,15 +178,17 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     case MFIOC_CHANGE_PRIORITY:
         dev->current_priority++;
         dev->current_priority %= PRIORITIES;
-        SWAP(file->f_pos, dev->old_pos, loff_t);
+        ret = dev->current_priority;
+        SWAP(file->f_pos, ((device_data *)file->private_data)->old_pos, loff_t);
         break;
     
     default:
+        ret = 0;
         break;
     }
     mutex_unlock(&(dev->operation_synchronizer));
 
-    return 0;
+    return ret;
 }
 
 static struct file_operations fops = {
@@ -191,7 +207,6 @@ int multi_flow_init(void)
     for (i = 0; i < MINORS; i++){
         devices[i].current_priority = LOW_PRIORITY;
         devices[i].disabled = 0;
-        devices[i].old_pos = 0;
         mutex_init(&(devices[i].operation_synchronizer));
         for (j = 0; j < PRIORITIES; j++) {
             devices[i].valid_bytes[j] = 0;
