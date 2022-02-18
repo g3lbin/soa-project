@@ -8,9 +8,9 @@
 
 int i;
 char buff[4096];
-#define DATA_LOW "ciao a tutti\n"
+#define DATA_LOW "abcdefghijklmnopqrstuvwxyz"
 #define SIZE_LOW strlen(DATA_LOW)
-#define DATA_HIGH "eccolo\n"
+#define DATA_HIGH "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 #define SIZE_HIGH strlen(DATA_HIGH)
 
 void * the_thread(void *path){
@@ -23,7 +23,7 @@ void * the_thread(void *path){
 	sleep(1);
 
 	memset(command, 0x0, strlen(command));
-	sprintf(command, "cat %s\n", device);
+	sprintf(command, "echo '\n' && cat %s\n", device);
 
 	/* TEST OPEN */
 	printf("opening device %s\n", device);
