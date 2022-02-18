@@ -11,6 +11,8 @@ Debug/
 ## COMPILATION ##
 *.cmd
 *.cmd.*
+*.mod
+*.mod.*
 *.o
 *.o.*
 *.ko
@@ -20,3 +22,4 @@ Debug/
 
 ## USER APP ##
 user/user
+user/device-controller
