@@ -30,12 +30,6 @@ MODULE_AUTHOR("Cristiano Cuffaro");
 
 #define SWITCH_PRIORITY_IOCTL (0)
 
-static int dev_open(struct inode *, struct file *);
-static int dev_release(struct inode *, struct file *);
-static ssize_t dev_read(struct file *, char *, size_t, loff_t *);
-static ssize_t dev_write(struct file *, const char *, size_t, loff_t *);
-static long dev_ioctl(struct file *, unsigned int, unsigned long);
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
 #define get_major(session)      MAJOR(session->f_inode->i_rdev)
 #define get_minor(session)      MINOR(session->f_inode->i_rdev)
@@ -52,13 +46,6 @@ static long dev_ioctl(struct file *, unsigned int, unsigned long);
             ret = copy_from_user(dest, src, count);     \
         }                                               \
     } while(0)
-
-// if (priority == LOW_PRIORITY) {
-//     memcpy(dev->streams[priority] + first_free_byte, buf, amount);
-//     ret = 0;
-// } else {
-//     ret = copy_from_user(dev->streams[priority] + first_free_byte, buf, amount);
-// }
 
 typedef struct _device_state {
     struct workqueue_struct *queue;     // for asynchronous execution of low priority write operations
@@ -79,17 +66,75 @@ typedef struct _packed_write {
     short priority;
     char *buf;
     size_t count;
-    ssize_t (*real_write)(short priority, device_state *dev, const char *buf, size_t count);
+    ssize_t (*real_write)(short, device_state *, const char *, size_t);
 } packed_write;
+
+static int dev_open(struct inode *, struct file *);
+static int dev_release(struct inode *, struct file *);
+static ssize_t dev_read(struct file *, char *, size_t, loff_t *);
+static ssize_t dev_write(struct file *, const char *, size_t, loff_t *);
+static long dev_ioctl(struct file *, unsigned int, unsigned long);
+void deferred_write(unsigned long);
+ssize_t actual_write(short, device_state *, const char *, size_t);
 
 static int Major;                       // major number assigned to broadcast device driver
 device_state devices[MINORS];
+
+/* internal functions */
+
+void deferred_write(unsigned long data)
+{
+    packed_write *wr_info;
+    
+    wr_info = (packed_write *)container_of((void *)data, packed_write, the_work);
+    printk("%s: somebody called a low priority write on dev with [major,minor] number [%d,%d]\n",
+        MODNAME, wr_info->major, wr_info->minor);
+    (wr_info->real_write)(wr_info->priority, devices + wr_info->minor, wr_info->buf, wr_info->count);
+    
+    free_page((unsigned long)wr_info->buf);
+    kfree((void *)wr_info);
+    module_put(THIS_MODULE);
+}
+
+ssize_t actual_write(short priority, device_state *dev, const char *buf, size_t count)
+{
+    short ret;
+    short amount;
+    short first_free_byte;
+
+    mutex_lock(&(dev->sync[priority]));
+
+    if(dev->valid_bytes[priority] == MAX_STREAM_SIZE) {          // the stream is full
+        mutex_unlock(&(dev->sync[priority]));
+        return -ENOSPC; // no space left on device
+    }
+    
+    if ((MAX_STREAM_SIZE - dev->valid_bytes[priority]) < count)  // write only in the free space
+        count = (MAX_STREAM_SIZE - dev->valid_bytes[priority]);
+    
+    first_free_byte = (dev->start[priority] + dev->valid_bytes[priority]) % MAX_STREAM_SIZE;
+    if (count > (MAX_STREAM_SIZE - first_free_byte)) {      // due to the circularity of the buffer
+        amount = (MAX_STREAM_SIZE - first_free_byte);
+        do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
+        first_free_byte = (first_free_byte + (amount - ret)) % MAX_STREAM_SIZE;
+        dev->valid_bytes[priority] += (amount - ret);
+        buf += (amount - ret);
+        amount = (count - (amount - ret));
+    } else {
+        amount = count;
+    }
+    do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
+    dev->valid_bytes[priority] += (amount - ret);
+
+    mutex_unlock(&(dev->sync[priority]));
+
+    return (count - ret);
+}
 
 /* the actual driver */
 
 static int dev_open(struct inode *inode, struct file *file)
 {
-    // int idx;
     device_state *dev;
     int minor = get_minor(file);
 
@@ -104,15 +149,6 @@ static int dev_open(struct inode *inode, struct file *file)
 	}
     ((device_data *)file->private_data)->current_priority = LOW_PRIORITY;   // default for new open
 
-    // if (file->f_mode & FMODE_READ)
-    //      printk("%s: read mode\n",MODNAME);
-    // if (file->f_mode & FMODE_WRITE)
-    //      printk("%s: write mode\n",MODNAME);
-    // if (file->f_flags & O_APPEND) {
-    //     idx = dev->current_priority;
-    //     file->f_pos = dev->valid_bytes[idx];
-    //     ((device_data *)file->private_data)->old_pos = dev->valid_bytes[(idx+1)%PRIORITIES];
-    // }
     if(!try_module_get(THIS_MODULE))
         return -ENODEV;
 
@@ -170,55 +206,6 @@ ssize_t dev_read(struct file *file, char *buf, size_t count, loff_t *pos)
     return (count - ret);
 }
 
-void deferred_write(unsigned long data)
-{
-    packed_write *wr_info;
-    
-    wr_info = (packed_write *)container_of((void *)data, packed_write, the_work);
-    printk("%s: somebody called a low priority write on dev with [major,minor] number [%d,%d]\n",
-        MODNAME, wr_info->major, wr_info->minor);
-    (wr_info->real_write)(wr_info->priority, devices + wr_info->minor, wr_info->buf, wr_info->count);
-    
-    free_page((unsigned long)wr_info->buf);
-    kfree((void *)wr_info);
-    module_put(THIS_MODULE);
-}
-
-ssize_t actual_write(short priority, device_state *dev, const char *buf, size_t count)
-{
-    short ret;
-    short amount;
-    short first_free_byte;
-
-    mutex_lock(&(dev->sync[priority]));
-
-    if(dev->valid_bytes[priority] == MAX_STREAM_SIZE) {          // the stream is full
-        mutex_unlock(&(dev->sync[priority]));
-        return -ENOSPC; // no space left on device
-    }
-    
-    if ((MAX_STREAM_SIZE - dev->valid_bytes[priority]) < count)  // write only in the free space
-        count = (MAX_STREAM_SIZE - dev->valid_bytes[priority]);
-    
-    first_free_byte = (dev->start[priority] + dev->valid_bytes[priority]) % MAX_STREAM_SIZE;
-    if (count > (MAX_STREAM_SIZE - first_free_byte)) {      // due to the circularity of the buffer
-        amount = (MAX_STREAM_SIZE - first_free_byte);
-        do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
-        first_free_byte = (first_free_byte + (amount - ret)) % MAX_STREAM_SIZE;
-        dev->valid_bytes[priority] += (amount - ret);
-        buf += (amount - ret);
-        amount = (count - (amount - ret));
-    } else {
-        amount = count;
-    }
-    do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
-    dev->valid_bytes[priority] += (amount - ret);
-
-    mutex_unlock(&(dev->sync[priority]));
-
-    return (count - ret);
-}
-
 ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
 {
     short ret;
@@ -256,8 +243,9 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
     work_container->real_write = actual_write;
     
     __INIT_WORK(&(work_container->the_work), (void *)deferred_write, (unsigned long)(&(work_container->the_work)));
+    queue_work((devices + get_minor(file))->queue, &work_container->the_work);
 
-    return (ssize_t)queue_work((devices + get_minor(file))->queue, &work_container->the_work);
+    return (count - ret);
 }
 
 static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
