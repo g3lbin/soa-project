@@ -11,6 +11,7 @@
 #include <linux/mm.h>
 #include <linux/workqueue.h>
 #include <linux/string.h>
+#include <linux/wait.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Cristiano Cuffaro");
@@ -48,16 +49,20 @@ MODULE_AUTHOR("Cristiano Cuffaro");
     } while(0)
 
 typedef struct _device_state {
-    struct workqueue_struct *queue;     // for asynchronous execution of low priority write operations
-    struct mutex sync[PRIORITIES];      // operation synchronizer of each stream
-    short start[PRIORITIES];            // first valid byte of each stream
-    short valid_bytes[PRIORITIES];      // valid bytes of each stream
-    char *streams[PRIORITIES];          // streams' addresses
+    wait_queue_head_t wr_waitq[PRIORITIES];    // for blocking write operations
+    wait_queue_head_t rd_waitq[PRIORITIES];    // for blocking read operations
+    struct workqueue_struct *wr_workq;          // for asynchronous execution of low priority write operations
+    struct mutex sync[PRIORITIES];              // operation synchronizer of each stream
+    short start[PRIORITIES];                    // first valid byte of each stream
+    short valid_bytes[PRIORITIES];              // valid bytes of each stream
+    char *streams[PRIORITIES];                  // streams' addresses
 } device_state;
 
-typedef struct _device_data {
-    short current_priority;             // priority level for the operation
-} device_data;
+typedef struct _session_data {
+    short current_priority;                     // priority level for the operation
+    bool blocking_ops;                          // switch to blocking or non-blocking read and write operations
+    long timeout;                               // timeout in jiffies to break the wait
+} session_data;
 
 typedef struct _packed_write {
     struct work_struct the_work;
@@ -85,12 +90,18 @@ device_state devices[MINORS];
 void deferred_write(unsigned long data)
 {
     packed_write *wr_info;
-    
+    device_state *dev;
+
     wr_info = (packed_write *)container_of((void *)data, packed_write, the_work);
     printk("%s: somebody called a low priority write on dev with [major,minor] number [%d,%d]\n",
         MODNAME, wr_info->major, wr_info->minor);
-    (wr_info->real_write)(wr_info->priority, devices + wr_info->minor, wr_info->buf, wr_info->count);
-    
+
+    dev = devices + wr_info->minor;
+
+    mutex_lock(&(dev->sync[wr_info->priority]));
+    (wr_info->real_write)(wr_info->priority, dev, wr_info->buf, wr_info->count);
+    mutex_unlock(&(dev->sync[wr_info->priority]));
+
     free_page((unsigned long)wr_info->buf);
     kfree((void *)wr_info);
     module_put(THIS_MODULE);
@@ -101,16 +112,6 @@ ssize_t actual_write(short priority, device_state *dev, const char *buf, size_t 
     short ret;
     short amount;
     short first_free_byte;
-
-    mutex_lock(&(dev->sync[priority]));
-
-    if(dev->valid_bytes[priority] == MAX_STREAM_SIZE) {          // the stream is full
-        mutex_unlock(&(dev->sync[priority]));
-        return -ENOSPC; // no space left on device
-    }
-    
-    if ((MAX_STREAM_SIZE - dev->valid_bytes[priority]) < count)  // write only in the free space
-        count = (MAX_STREAM_SIZE - dev->valid_bytes[priority]);
     
     first_free_byte = (dev->start[priority] + dev->valid_bytes[priority]) % MAX_STREAM_SIZE;
     if (count > (MAX_STREAM_SIZE - first_free_byte)) {      // due to the circularity of the buffer
@@ -126,7 +127,32 @@ ssize_t actual_write(short priority, device_state *dev, const char *buf, size_t 
     do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
     dev->valid_bytes[priority] += (amount - ret);
 
-    mutex_unlock(&(dev->sync[priority]));
+    wake_up_interruptible(&(dev->rd_waitq[priority]));
+
+    return (count - ret);
+}
+
+ssize_t actual_read(short priority, device_state *dev, char *buf, size_t count)
+{
+    short ret;
+    short amount;
+
+    if (dev->valid_bytes[priority] < count)
+        count = dev->valid_bytes[priority];
+
+    if (count > (MAX_STREAM_SIZE - dev->start[priority])) {  // due to the circularity of the buffer
+        amount = (MAX_STREAM_SIZE - dev->start[priority]);
+        ret = copy_to_user(buf, dev->streams[priority] + dev->start[priority], amount);
+        dev->start[priority] = (dev->start[priority] + (amount - ret)) % MAX_STREAM_SIZE;
+        dev->valid_bytes[priority] -= (amount - ret);
+        buf += (amount - ret);
+        amount = (count - (amount - ret));
+    } else {
+        amount = count;
+    }
+    ret = copy_to_user(buf, dev->streams[priority] + dev->start[priority], amount);
+    dev->start[priority] = (dev->start[priority] + (amount - ret)) % MAX_STREAM_SIZE;
+    dev->valid_bytes[priority] -= (amount - ret);
 
     return (count - ret);
 }
@@ -143,11 +169,14 @@ static int dev_open(struct inode *inode, struct file *file)
 
     dev = devices + minor;
 
-    file->private_data = kzalloc(sizeof(device_data), GFP_KERNEL);
+    file->private_data = kzalloc(sizeof(session_data), GFP_KERNEL);
 	if (!file->private_data) {
 		return -ENOMEM;
 	}
-    ((device_data *)file->private_data)->current_priority = LOW_PRIORITY;   // default for new open
+    /* set defaults values for new session */
+    ((session_data *)file->private_data)->current_priority = LOW_PRIORITY;
+    ((session_data *)file->private_data)->blocking_ops = true;
+    ((session_data *)file->private_data)->timeout = 999999999;     // (DA CAMBIARE) no timeout
 
     if(!try_module_get(THIS_MODULE))
         return -ENODEV;
@@ -172,38 +201,45 @@ static int dev_release(struct inode *inode, struct file *file)
 
 ssize_t dev_read(struct file *file, char *buf, size_t count, loff_t *pos)
 {
-    short ret;
+    long ret;
     short idx;
-    short amount;
     device_state *dev;
     
     dev = devices + get_minor(file);
     printk("%s: somebody called a read on dev with [major,minor] number [%d,%d]\n",MODNAME,get_major(file),get_minor(file));
 
-    idx = ((device_data *)file->private_data)->current_priority;
+    idx = ((session_data *)file->private_data)->current_priority;
 
-    mutex_lock(&(dev->sync[idx]));
-    
-    if (dev->valid_bytes[idx] < count)
-        count = dev->valid_bytes[idx];
-
-    if (count > (MAX_STREAM_SIZE - dev->start[idx])) {  // due to the circularity of the buffer
-        amount = (MAX_STREAM_SIZE - dev->start[idx]);
-        ret = copy_to_user(buf, dev->streams[idx] + dev->start[idx], amount);
-        dev->start[idx] = (dev->start[idx] + (amount - ret)) % MAX_STREAM_SIZE;
-        dev->valid_bytes[idx] -= (amount - ret);
-        buf += (amount - ret);
-        amount = (count - (amount - ret));
+    if (((session_data *)file->private_data)->blocking_ops) {
+retry_read:
+        ret = wait_event_interruptible_timeout(dev->rd_waitq[idx], dev->valid_bytes[idx] > 0,
+            ((session_data *)file->private_data)->timeout);
+        printk("%s: returned on runqueue with value: %ld\n", MODNAME, ret);
+        if (ret == 0) {
+            return -ETIME;
+        }
+        if (ret == -ERESTARTSYS) {
+            return -EINTR;
+        }
+        if (!mutex_trylock(&(dev->sync[idx])))
+            goto retry_read;
+        if (dev->valid_bytes[idx] == 0) {
+            mutex_unlock(&(dev->sync[idx]));
+            goto retry_read;
+        } 
     } else {
-        amount = count;
+        mutex_lock(&(dev->sync[idx]));
+        if (dev->valid_bytes[idx] == 0) {
+            mutex_unlock(&(dev->sync[idx]));
+            return -EAGAIN;
+        }
     }
-    ret = copy_to_user(buf, dev->streams[idx] + dev->start[idx], amount);
-    dev->start[idx] = (dev->start[idx] + (amount - ret)) % MAX_STREAM_SIZE;
-    dev->valid_bytes[idx] -= (amount - ret);
+    
+    ret = actual_read(idx, dev, buf, count);
 
     mutex_unlock(&(dev->sync[idx]));
 
-    return (count - ret);
+    return (ssize_t)ret;
 }
 
 ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
@@ -211,11 +247,27 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
     short ret;
     short priority;
     packed_write *work_container;
+    device_state *dev;
     
-    priority = ((device_data *)file->private_data)->current_priority;
+    dev = devices + get_minor(file);
+    priority = ((session_data *)file->private_data)->current_priority;
+
+    mutex_lock(&(dev->sync[priority]));
+
+    if(dev->valid_bytes[priority] == MAX_STREAM_SIZE) {          // the stream is full
+        mutex_unlock(&(dev->sync[priority]));
+        return -ENOSPC; // no space left on device
+    }
+    
+    if ((MAX_STREAM_SIZE - dev->valid_bytes[priority]) < count)  // write only in the free space
+        count = (MAX_STREAM_SIZE - dev->valid_bytes[priority]);
+
     if (priority == HIGH_PRIORITY) {
         printk("%s: somebody called an high priority write on dev with [major,minor] number [%d,%d]\n",MODNAME,get_major(file),get_minor(file));
-        return actual_write(priority, devices + get_minor(file), buf, count);
+        ret = actual_write(priority, dev, buf, count);
+        mutex_unlock(&(dev->sync[priority]));
+        
+        return ret;
     }
     
     if(!try_module_get(THIS_MODULE))
@@ -223,6 +275,7 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
 
     work_container = (packed_write *)kzalloc(sizeof(packed_write), GFP_ATOMIC);     // non blocking memory allocation
     if (!work_container) {
+        mutex_unlock(&(dev->sync[priority]));
         module_put(THIS_MODULE);
         return -ENOMEM;
     }
@@ -233,17 +286,20 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
     work_container->buf = (char *)get_zeroed_page(GFP_KERNEL | GFP_ATOMIC);
     if (!work_container->buf) {
         kfree((void *)work_container);
+        mutex_unlock(&(dev->sync[priority]));
         module_put(THIS_MODULE);
         return -ENOMEM;
     }
     if (count > MAX_STREAM_SIZE)
         count = MAX_STREAM_SIZE;
     ret = copy_from_user(work_container->buf, buf, count);
+
     work_container->count = count - ret;
     work_container->real_write = actual_write;
     
     __INIT_WORK(&(work_container->the_work), (void *)deferred_write, (unsigned long)(&(work_container->the_work)));
-    queue_work((devices + get_minor(file))->queue, &work_container->the_work);
+    queue_work(dev->wr_workq, &work_container->the_work);
+    mutex_unlock(&(dev->sync[priority]));
 
     return (count - ret);
 }
@@ -257,10 +313,10 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     switch (cmd)
     {
     case SWITCH_PRIORITY_IOCTL:
-        if (((device_data *)file->private_data)->current_priority == LOW_PRIORITY)
-            ret = ((device_data *)file->private_data)->current_priority = HIGH_PRIORITY;
+        if (((session_data *)file->private_data)->current_priority == LOW_PRIORITY)
+            ret = ((session_data *)file->private_data)->current_priority = HIGH_PRIORITY;
         else
-            ret = ((device_data *)file->private_data)->current_priority = LOW_PRIORITY;
+            ret = ((session_data *)file->private_data)->current_priority = LOW_PRIORITY;
         break;
     
     default:
@@ -280,7 +336,7 @@ static struct file_operations fops = {
     .unlocked_ioctl = dev_ioctl
 };
 
-int multi_flow_init(void)
+int multi_flow_dev_init(void)
 {
     int i, j, k;
     char queue_name[WQ_NAME_LENGTH];
@@ -288,8 +344,8 @@ int multi_flow_init(void)
     // initialize the drive internal state
     for (i = 0; i < MINORS; i++) {
         snprintf(queue_name, sizeof(queue_name), "%s-%d", DEVICE_NAME, i);
-        devices[i].queue = create_singlethread_workqueue(queue_name);
-        if (!devices[i].queue) {
+        devices[i].wr_workq = create_singlethread_workqueue(queue_name);
+        if (!devices[i].wr_workq) {
             if (i > 0) {
                 j = 0;
                 goto revert_allocation;
@@ -297,6 +353,8 @@ int multi_flow_init(void)
             return -ENOMEM;
         }
         for (j = 0; j < PRIORITIES; j++) {
+            init_waitqueue_head(&(devices[i].rd_waitq[j]));
+            init_waitqueue_head(&(devices[i].wr_waitq[j]));
             mutex_init(&(devices[i].sync[j]));
             devices[i].start[j] = 0;
             devices[i].valid_bytes[j] = 0;
@@ -319,6 +377,7 @@ int multi_flow_init(void)
 
 revert_allocation:
         for (; i >= 0; i--){
+            destroy_workqueue(devices[i].wr_workq);
             for (k = 0; k < PRIORITIES; k++) {
                 free_page((unsigned long)devices[i].streams[k]);
                 if (i == 0 && k == j)
@@ -328,11 +387,11 @@ revert_allocation:
         return -ENOMEM;
 }
 
-void multi_flow_cleanup(void) {
+void multi_flow_dev_cleanup(void) {
 
     int i, k;
     for(i = 0; i < MINORS; i++) {
-        destroy_workqueue(devices[i].queue);
+        destroy_workqueue(devices[i].wr_workq);
         for (k = 0; k < PRIORITIES; k++) {
                 free_page((unsigned long)devices[i].streams[k]);
             }
@@ -345,5 +404,5 @@ void multi_flow_cleanup(void) {
     return;
 }
 
-module_init(multi_flow_init);
-module_exit(multi_flow_cleanup);
+module_init(multi_flow_dev_init);
+module_exit(multi_flow_dev_cleanup);
