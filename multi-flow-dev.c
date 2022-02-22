@@ -50,11 +50,10 @@ enum {
         } else {                                        \
             ret = copy_from_user(dest, src, count);     \
         }                                               \
-    } while(0)
+    } while (0)
 
 typedef struct _device_state {
-    wait_queue_head_t wr_waitq[PRIORITIES];     // for blocking write operations
-    wait_queue_head_t rd_waitq[PRIORITIES];     // for blocking read operations
+    wait_queue_head_t waitq[PRIORITIES];        // for blocking read and write operations
     struct workqueue_struct *wr_workq;          // for asynchronous execution of low priority write operations
     struct mutex sync[PRIORITIES];              // operation synchronizer of each stream
     short start[PRIORITIES];                    // first valid byte of each stream
@@ -105,6 +104,7 @@ void deferred_write(unsigned long data)
 
     mutex_lock(&(dev->sync[wr_info->priority]));
     (wr_info->real_write)(wr_info->priority, dev, wr_info->buf, wr_info->count);
+    wake_up_interruptible(&(dev->waitq[wr_info->priority]));
     mutex_unlock(&(dev->sync[wr_info->priority]));
 
     free_page((unsigned long)wr_info->buf);
@@ -131,8 +131,6 @@ ssize_t actual_write(short priority, device_state *dev, const char *buf, size_t 
     }
     do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
     dev->valid_bytes[priority] += (amount - ret);
-
-    wake_up_interruptible(&(dev->rd_waitq[priority]));
 
     return (count - ret);
 }
@@ -234,10 +232,10 @@ ssize_t dev_read(struct file *file, char *buf, size_t count, loff_t *pos)
         }
     } else {
 retry_read:
-        ret = wait_event_interruptible_timeout(dev->rd_waitq[idx],
+        ret = wait_event_interruptible_timeout(dev->waitq[idx],
                 dev->valid_bytes[idx] > 0 || ((session_data *)file->private_data)->read_residual,
                 ((session_data *)file->private_data)->timeout);
-        printk("%s: returned on runqueue with residual value: %d\n", MODNAME, ((session_data *)file->private_data)->read_residual);
+        printk("%s: reader returned on runqueue with residual value: %d\n", MODNAME, ((session_data *)file->private_data)->read_residual);
         if (ret == 0) {
             return -ETIME;
         }
@@ -261,6 +259,7 @@ retry_read:
     if (ret < count)
         ((session_data *)file->private_data)->read_residual = true;
 
+    wake_up_interruptible(&(dev->waitq[idx]));
     mutex_unlock(&(dev->sync[idx]));
 
     return (ssize_t)ret;
@@ -269,48 +268,80 @@ retry_read:
 ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
 {
     short ret;
-    short priority;
+    short idx;
     packed_write *work_container;
     device_state *dev;
+    gfp_t mask = GFP_KERNEL;
     
     dev = devices + get_minor(file);
-    priority = ((session_data *)file->private_data)->current_priority;
+    idx = ((session_data *)file->private_data)->current_priority;
 
-    mutex_lock(&(dev->sync[priority]));
-
-    if(dev->valid_bytes[priority] == MAX_STREAM_SIZE) {          // the stream is full
-        mutex_unlock(&(dev->sync[priority]));
-        return -ENOSPC; // no space left on device
+    if (file->f_flags & O_NONBLOCK) {
+        if (!mutex_trylock(&(dev->sync[idx])))
+            return -EAGAIN;
+        if (dev->valid_bytes[idx] == MAX_STREAM_SIZE) {            // the stream is full 
+            mutex_unlock(&(dev->sync[idx]));
+            return -EAGAIN;
+        }
+    } else {
+retry_write:
+        ret = wait_event_interruptible_timeout(dev->waitq[idx],
+                dev->valid_bytes[idx] < MAX_STREAM_SIZE || ((session_data *)file->private_data)->write_residual,
+                ((session_data *)file->private_data)->timeout);
+        printk("%s: writer returned on runqueue with residual value: %d\n", MODNAME, ((session_data *)file->private_data)->write_residual);
+        if (ret == 0) {
+            return -ETIME;
+        }
+        if (ret == -ERESTARTSYS) {
+            return -EINTR;
+        }
+        if (!mutex_trylock(&(dev->sync[idx])))
+            goto retry_write;
+        if (dev->valid_bytes[idx] == MAX_STREAM_SIZE) {
+            mutex_unlock(&(dev->sync[idx]));
+            if (((session_data *)file->private_data)->write_residual) {
+                ((session_data *)file->private_data)->write_residual = false;
+                return 0;           // no bytes left on current device stream
+            }
+            goto retry_write;       // someone has write before you
+        }
+        ((session_data *)file->private_data)->write_residual = false;
     }
     
-    if ((MAX_STREAM_SIZE - dev->valid_bytes[priority]) < count)  // write only in the free space
-        count = (MAX_STREAM_SIZE - dev->valid_bytes[priority]);
+    if ((MAX_STREAM_SIZE - dev->valid_bytes[idx]) < count)      // do partial write
+        count = (MAX_STREAM_SIZE - dev->valid_bytes[idx]);
 
-    if (priority == HIGH_PRIORITY) {
+    if (idx == HIGH_PRIORITY) {
         printk("%s: somebody called an high priority write on dev with [major,minor] number [%d,%d]\n",MODNAME,get_major(file),get_minor(file));
-        ret = actual_write(priority, dev, buf, count);
-        mutex_unlock(&(dev->sync[priority]));
+        ret = actual_write(idx, dev, buf, count);
+        wake_up_interruptible(&(dev->waitq[idx]));
+        mutex_unlock(&(dev->sync[idx]));
         
         return ret;
     }
     
-    if(!try_module_get(THIS_MODULE))
+    if(!try_module_get(THIS_MODULE)) {
+        mutex_unlock(&(dev->sync[idx]));
         return -ENODEV;
+    }
 
-    work_container = (packed_write *)kzalloc(sizeof(packed_write), GFP_ATOMIC);     // non blocking memory allocation
+    if (file->f_flags & O_NONBLOCK)
+        mask |= GFP_ATOMIC;                 // non blocking memory allocation
+
+    work_container = (packed_write *)kzalloc(sizeof(packed_write), mask);
     if (!work_container) {
-        mutex_unlock(&(dev->sync[priority]));
+        mutex_unlock(&(dev->sync[idx]));
         module_put(THIS_MODULE);
         return -ENOMEM;
     }
 
     work_container->major = get_major(file);
     work_container->minor = get_minor(file);
-    work_container->priority = priority;
-    work_container->buf = (char *)get_zeroed_page(GFP_KERNEL | GFP_ATOMIC);
+    work_container->priority = idx;
+    work_container->buf = (char *)get_zeroed_page(mask);
     if (!work_container->buf) {
         kfree((void *)work_container);
-        mutex_unlock(&(dev->sync[priority]));
+        mutex_unlock(&(dev->sync[idx]));
         module_put(THIS_MODULE);
         return -ENOMEM;
     }
@@ -323,7 +354,7 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
     
     __INIT_WORK(&(work_container->the_work), (void *)deferred_write, (unsigned long)(&(work_container->the_work)));
     queue_work(dev->wr_workq, &work_container->the_work);
-    mutex_unlock(&(dev->sync[priority]));
+    mutex_unlock(&(dev->sync[idx]));
 
     return (count - ret);
 }
@@ -384,8 +415,7 @@ int multi_flow_dev_init(void)
             return -ENOMEM;
         }
         for (j = 0; j < PRIORITIES; j++) {
-            init_waitqueue_head(&(devices[i].rd_waitq[j]));
-            init_waitqueue_head(&(devices[i].wr_waitq[j]));
+            init_waitqueue_head(&(devices[i].waitq[j]));
             mutex_init(&(devices[i].sync[j]));
             devices[i].start[j] = 0;
             devices[i].valid_bytes[j] = 0;

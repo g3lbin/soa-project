@@ -18,6 +18,7 @@ void * the_thread(void *path){
     int op;
 	int ret;
     int num;
+    int ch;
 	char command[256];
     char bytes[4100];
 
@@ -39,6 +40,7 @@ void * the_thread(void *path){
 		printf("7) Quit\n");
 
         scanf("%d", &op);
+        while (getchar() != '\n');
 
         memset(bytes, 0x0, sizeof(bytes));
         num = 0;
@@ -60,8 +62,12 @@ void * the_thread(void *path){
             break;
         case 3:
             printf("insert the bytes which should be written:\n");
-            scanf("%s", bytes);
-            ret = write(fd, bytes, strlen(bytes));
+            num = 0;
+            while ((ch = getchar()) != '\n' && ch != EOF) {
+                bytes[num++] = ch;
+            }
+            bytes[num] = '\0';
+            ret = write(fd, bytes, num);
             if (ret < 0)
                 printf("(%d) write on device '%s' failed\n\n", ret, device);
             else
@@ -70,6 +76,7 @@ void * the_thread(void *path){
         case 4:
             printf("insert the number of bytes which should be read:\n");
             scanf("%d", &num);
+            while (getchar() != '\n');
             ret = read(fd, bytes, num);
             if (ret < 0)
                 printf("(%d) read on device '%s' failed\n\n", ret, device);
@@ -92,7 +99,6 @@ void * the_thread(void *path){
 		    printf("uscita...\n\n");
             goto end;
         }
-        while ( getchar() != '\n' );
         getchar();
     }
 end:
