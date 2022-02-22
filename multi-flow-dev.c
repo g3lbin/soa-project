@@ -29,7 +29,10 @@ MODULE_AUTHOR("Cristiano Cuffaro");
 
 #define MAX_STREAM_SIZE  (4096)         // just one page: 4KB
 
-#define SWITCH_PRIORITY_IOCTL (0)
+enum {
+    SWITCH_PRIORITY_IOCTL = 0,
+    SWITCH_BLOCKING_IOCTL,
+};
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
 #define get_major(session)      MAJOR(session->f_inode->i_rdev)
@@ -39,8 +42,9 @@ MODULE_AUTHOR("Cristiano Cuffaro");
 #define get_minor(session)      MINOR(session->f_dentry->d_inode->i_rdev)
 #endif
 
-#define do_write(priority, dest, src, count, ret) do    \
-    {   if (priority == LOW_PRIORITY) {                 \
+#define do_write(priority, dest, src, count, ret)       \
+    do {                                                \
+        if (priority == LOW_PRIORITY) {                 \
             memcpy(dest, src, count);                   \
             ret = 0;                                    \
         } else {                                        \
@@ -49,8 +53,8 @@ MODULE_AUTHOR("Cristiano Cuffaro");
     } while(0)
 
 typedef struct _device_state {
-    wait_queue_head_t wr_waitq[PRIORITIES];    // for blocking write operations
-    wait_queue_head_t rd_waitq[PRIORITIES];    // for blocking read operations
+    wait_queue_head_t wr_waitq[PRIORITIES];     // for blocking write operations
+    wait_queue_head_t rd_waitq[PRIORITIES];     // for blocking read operations
     struct workqueue_struct *wr_workq;          // for asynchronous execution of low priority write operations
     struct mutex sync[PRIORITIES];              // operation synchronizer of each stream
     short start[PRIORITIES];                    // first valid byte of each stream
@@ -60,8 +64,9 @@ typedef struct _device_state {
 
 typedef struct _session_data {
     short current_priority;                     // priority level for the operation
-    bool blocking_ops;                          // switch to blocking or non-blocking read and write operations
     long timeout;                               // timeout in jiffies to break the wait
+    bool read_residual;                         // to distinguish the first attempt to read from the following
+    bool write_residual;                        // to distinguish the first attempt to write from the following
 } session_data;
 
 typedef struct _packed_write {
@@ -163,25 +168,35 @@ static int dev_open(struct inode *inode, struct file *file)
 {
     device_state *dev;
     int minor = get_minor(file);
+    gfp_t mask = GFP_KERNEL;
 
     if (minor >= MINORS)
         return -ENODEV;
 
     dev = devices + minor;
 
-    file->private_data = kzalloc(sizeof(session_data), GFP_KERNEL);
+    if (file->f_flags & O_NONBLOCK)
+        mask |= GFP_ATOMIC;
+
+    file->private_data = kzalloc(sizeof(session_data), mask);
 	if (!file->private_data) {
 		return -ENOMEM;
 	}
     /* set defaults values for new session */
     ((session_data *)file->private_data)->current_priority = LOW_PRIORITY;
-    ((session_data *)file->private_data)->blocking_ops = true;
-    ((session_data *)file->private_data)->timeout = 999999999;     // (DA CAMBIARE) no timeout
+    ((session_data *)file->private_data)->timeout = 999999999;      // (DA CAMBIARE) no timeout
+    ((session_data *)file->private_data)->read_residual = false;    // first attempt to read
+    ((session_data *)file->private_data)->write_residual = false;   // first attempt to write
 
     if(!try_module_get(THIS_MODULE))
         return -ENODEV;
 
-    printk("%s: device file successfully opened for object with minor %d\n", MODNAME, minor);
+// INIZIO DA RIMUOVERE
+    if (file->f_flags & O_NONBLOCK)
+        printk("%s: device file successfully opened with flag O_NONBLOCK for object with minor %d\n", MODNAME, minor);
+    else
+        printk("%s: device file successfully opened for object with minor %d\n", MODNAME, minor);
+// FINE DA RIMUOVERE
 
     return 0;
 }
@@ -210,11 +225,19 @@ ssize_t dev_read(struct file *file, char *buf, size_t count, loff_t *pos)
 
     idx = ((session_data *)file->private_data)->current_priority;
 
-    if (((session_data *)file->private_data)->blocking_ops) {
+    if (file->f_flags & O_NONBLOCK) {
+        if (!mutex_trylock(&(dev->sync[idx])))
+            return -EAGAIN;
+        if (dev->valid_bytes[idx] == 0) {
+            mutex_unlock(&(dev->sync[idx]));
+            return -EAGAIN;
+        }
+    } else {
 retry_read:
-        ret = wait_event_interruptible_timeout(dev->rd_waitq[idx], dev->valid_bytes[idx] > 0,
-            ((session_data *)file->private_data)->timeout);
-        printk("%s: returned on runqueue with value: %ld\n", MODNAME, ret);
+        ret = wait_event_interruptible_timeout(dev->rd_waitq[idx],
+                dev->valid_bytes[idx] > 0 || ((session_data *)file->private_data)->read_residual,
+                ((session_data *)file->private_data)->timeout);
+        printk("%s: returned on runqueue with residual value: %d\n", MODNAME, ((session_data *)file->private_data)->read_residual);
         if (ret == 0) {
             return -ETIME;
         }
@@ -225,17 +248,18 @@ retry_read:
             goto retry_read;
         if (dev->valid_bytes[idx] == 0) {
             mutex_unlock(&(dev->sync[idx]));
-            goto retry_read;
-        } 
-    } else {
-        mutex_lock(&(dev->sync[idx]));
-        if (dev->valid_bytes[idx] == 0) {
-            mutex_unlock(&(dev->sync[idx]));
-            return -EAGAIN;
+            if (((session_data *)file->private_data)->read_residual) {
+                ((session_data *)file->private_data)->read_residual = false;
+                return 0;           // no bytes left on current device stream
+            }
+            goto retry_read;        // someone has read the bytes before you
         }
+        ((session_data *)file->private_data)->read_residual = false;
     }
     
     ret = actual_read(idx, dev, buf, count);
+    if (ret < count)
+        ((session_data *)file->private_data)->read_residual = true;
 
     mutex_unlock(&(dev->sync[idx]));
 
@@ -318,7 +342,14 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         else
             ret = ((session_data *)file->private_data)->current_priority = LOW_PRIORITY;
         break;
-    
+    case SWITCH_BLOCKING_IOCTL:
+        if (file->f_flags & O_NONBLOCK)
+            file->f_flags ^= O_NONBLOCK;
+        else
+            file->f_flags |= O_NONBLOCK;
+        ret = 0;
+        break;
+
     default:
         ret = -ENOTTY;
         break;

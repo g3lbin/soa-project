@@ -14,7 +14,7 @@ char buff[4096];
 
 void * the_thread(void *path){
 	char *device;
-	int fd;
+	int fd = -1;
     int op;
 	int ret;
     int num;
@@ -30,11 +30,13 @@ void * the_thread(void *path){
     while(1) {
         system("clear\n");
 		printf("*** Main menu ***\n\n");
-		printf("1) Write on low priority flow\n");
-		printf("2) Read from low priority flow\n");
-		printf("3) Write on high priority flow\n");
-		printf("4) Read from high priority flow\n");
-		printf("5) Quit\n");
+        printf("1) Open device\n");
+        printf("2) Close device\n");
+		printf("3) Write on current priority flow\n");
+		printf("4) Read on current priority flow\n");
+        printf("5) Switch to low or high priority flow for the device\n");
+        printf("6) Switch to blocking or non-blocking read and write operations\n");
+		printf("7) Quit\n");
 
         scanf("%d", &op);
 
@@ -45,88 +47,46 @@ void * the_thread(void *path){
         case 1:
             printf("opening device %s\n", device);
             fd = open(device, O_RDWR);
-            if(fd == -1) {
-                printf("open error on device %s\n", device);
+            if(fd < 0) {
+                printf("(%d) open error on device %s\n", fd, device);
                 return NULL;
             }
             printf("device %s successfully opened\n\n", device);
-
-            printf("insert the bytes which should be written:\n");
-            scanf("%s", bytes);
-            ret = write(fd, bytes, strlen(bytes));
-            if (ret == -1)
-                printf("write on device '%s' failed\n\n", device);
-            else
-                printf("writed %d bytes on low priority stream of device %s\n\n", ret, device);
-
-            close(fd);
             break;
         case 2:
-            printf("opening device %s\n", device);
-            fd = open(device, O_RDWR);
-            if(fd == -1) {
-                printf("open error on device %s\n", device);
-                return NULL;
-            }
-            printf("device %s successfully opened\n\n", device);
-
-            printf("insert the number of bytes which should be read:\n");
-            scanf("%d", &num);
-            ret = read(fd, bytes, num);
-            if (ret == -1)
-                printf("read on device '%s' failed\n\n", device);
-            else
-                printf("read bytes are the following:\n%s\n\n", bytes);
-
+            printf("device %s successfully closed\n\n", device);
             close(fd);
+            fd = -1;
             break;
         case 3:
-            printf("opening device %s\n", device);
-            fd = open(device, O_RDWR);
-            if(fd == -1) {
-                printf("open error on device %s\n", device);
-                return NULL;
-            }
-            printf("device %s successfully opened\n\n", device);
-
-            ret = ioctl(fd,0);
-            if (ret != 1)
-                printf("impossible to change priority level for device '%s'\n", device);
-                
             printf("insert the bytes which should be written:\n");
             scanf("%s", bytes);
             ret = write(fd, bytes, strlen(bytes));
-            if (ret == -1)
-                printf("write on device '%s' failed\n\n", device);
+            if (ret < 0)
+                printf("(%d) write on device '%s' failed\n\n", ret, device);
             else
                 printf("writed %d bytes on high priority stream of device %s\n\n", ret, device);
-
-            close(fd);
             break;
         case 4:
-            printf("opening device %s\n", device);
-            fd = open(device, O_RDWR);
-            if(fd == -1) {
-                printf("open error on device %s\n", device);
-                return NULL;
-            }
-            printf("device %s successfully opened\n\n", device);
-
-            ret = ioctl(fd,0);
-            if (ret != 1)
-                printf("impossible to change priority level for device '%s'\n", device);
-
             printf("insert the number of bytes which should be read:\n");
             scanf("%d", &num);
             ret = read(fd, bytes, num);
-            if (ret == -1)
-                printf("read on device '%s' failed\n\n", device);
+            if (ret < 0)
+                printf("(%d) read on device '%s' failed\n\n", ret, device);
             else
                 printf("read bytes are the following:\n%s\n\n", bytes);
 
-            close(fd);
             break;
-        
+        case 5:
+            ret = ioctl(fd,0);
+            if (ret < 0)
+                printf("(%d) impossible to change priority level for device '%s'\n", ret, device);
+            break;
+        case 6:
+            ret = ioctl(fd,1);
+            if (ret < 0)
+                printf("(%d) impossible to switch blocking operations mode for device '%s'\n", ret, device);
+            break;
         default:
             system("clear\n");
 		    printf("uscita...\n\n");
