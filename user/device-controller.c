@@ -19,6 +19,7 @@ void * the_thread(void *path){
 	int ret;
     int num;
     int ch;
+    long timeout;
 	char command[256];
     char bytes[4100];
 
@@ -37,7 +38,8 @@ void * the_thread(void *path){
 		printf("4) Read on current priority flow\n");
         printf("5) Switch to low or high priority flow for the device\n");
         printf("6) Switch to blocking or non-blocking read and write operations\n");
-		printf("7) Quit\n");
+        printf("7) Set a new time interval for blocking read and write operations\n");
+		printf("8) Quit\n");
 
         scanf("%d", &op);
         while (getchar() != '\n');
@@ -85,14 +87,23 @@ void * the_thread(void *path){
 
             break;
         case 5:
-            ret = ioctl(fd,0);
+            ret = ioctl(fd, 0);
             if (ret < 0)
                 printf("(%d) impossible to change priority level for device '%s'\n", ret, device);
             break;
         case 6:
-            ret = ioctl(fd,1);
+            ret = ioctl(fd, 1);
             if (ret < 0)
                 printf("(%d) impossible to switch blocking operations mode for device '%s'\n", ret, device);
+            break;
+        case 7:
+            printf("insert the new timeout value:\n");
+            scanf("%ld", &timeout);
+            while (getchar() != '\n');
+
+            ret = ioctl(fd, 2, &timeout);
+            if (ret < 0)
+                printf("(%d) impossible to set wait timeout interval for device '%s'\n", ret, device);
             break;
         default:
             system("clear\n");

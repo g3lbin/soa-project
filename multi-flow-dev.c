@@ -28,10 +28,12 @@ MODULE_AUTHOR("Cristiano Cuffaro");
 #define HIGH_PRIORITY (1)
 
 #define MAX_STREAM_SIZE  (4096)         // just one page: 4KB
+#define MAX_WAIT_TIMEINT (999999999L)   // represent infinite time in jiffies
 
 enum {
     SWITCH_PRIORITY_IOCTL = 0,
     SWITCH_BLOCKING_IOCTL,
+    SET_WAIT_TIMEINT_IOCTL,
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
@@ -57,7 +59,8 @@ typedef struct _device_state {
     struct workqueue_struct *wr_workq;          // for asynchronous execution of low priority write operations
     struct mutex sync[PRIORITIES];              // operation synchronizer of each stream
     short start[PRIORITIES];                    // first valid byte of each stream
-    short valid_bytes[PRIORITIES];              // valid bytes of each stream
+    atomic_t valid_bytes[PRIORITIES];           // valid bytes of each stream
+    atomic_t actually_writable[PRIORITIES];     // free space to execute write operations
     char *streams[PRIORITIES];                  // streams' addresses
 } device_state;
 
@@ -116,21 +119,25 @@ ssize_t actual_write(short priority, device_state *dev, const char *buf, size_t 
 {
     short ret;
     short amount;
-    short first_free_byte;
+    int first_free_byte;
     
-    first_free_byte = (dev->start[priority] + dev->valid_bytes[priority]) % MAX_STREAM_SIZE;
+    first_free_byte = (dev->start[priority] + atomic_read(&(dev->valid_bytes[priority]))) % MAX_STREAM_SIZE;
     if (count > (MAX_STREAM_SIZE - first_free_byte)) {      // due to the circularity of the buffer
         amount = (MAX_STREAM_SIZE - first_free_byte);
         do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
         first_free_byte = (first_free_byte + (amount - ret)) % MAX_STREAM_SIZE;
-        dev->valid_bytes[priority] += (amount - ret);
+        atomic_add((amount - ret), &(dev->valid_bytes[priority]));
+        if (priority == HIGH_PRIORITY)
+            atomic_sub((amount - ret), &(dev->actually_writable[priority]));
         buf += (amount - ret);
         amount = (count - (amount - ret));
     } else {
         amount = count;
     }
     do_write(priority, dev->streams[priority] + first_free_byte, buf, amount, ret);
-    dev->valid_bytes[priority] += (amount - ret);
+    atomic_add((amount - ret), &(dev->valid_bytes[priority]));
+    if (priority == HIGH_PRIORITY)
+            atomic_sub((amount - ret), &(dev->actually_writable[priority]));
 
     return (count - ret);
 }
@@ -140,14 +147,15 @@ ssize_t actual_read(short priority, device_state *dev, char *buf, size_t count)
     short ret;
     short amount;
 
-    if (dev->valid_bytes[priority] < count)
-        count = dev->valid_bytes[priority];
+    if ((ret = (short)atomic_read(&(dev->valid_bytes[priority]))) < count)
+        count = ret;
 
     if (count > (MAX_STREAM_SIZE - dev->start[priority])) {  // due to the circularity of the buffer
         amount = (MAX_STREAM_SIZE - dev->start[priority]);
         ret = copy_to_user(buf, dev->streams[priority] + dev->start[priority], amount);
         dev->start[priority] = (dev->start[priority] + (amount - ret)) % MAX_STREAM_SIZE;
-        dev->valid_bytes[priority] -= (amount - ret);
+        atomic_sub((amount - ret), &(dev->valid_bytes[priority]));
+        atomic_add((amount - ret), &(dev->actually_writable[priority]));
         buf += (amount - ret);
         amount = (count - (amount - ret));
     } else {
@@ -155,7 +163,8 @@ ssize_t actual_read(short priority, device_state *dev, char *buf, size_t count)
     }
     ret = copy_to_user(buf, dev->streams[priority] + dev->start[priority], amount);
     dev->start[priority] = (dev->start[priority] + (amount - ret)) % MAX_STREAM_SIZE;
-    dev->valid_bytes[priority] -= (amount - ret);
+    atomic_sub((amount - ret), &(dev->valid_bytes[priority]));
+    atomic_add((amount - ret), &(dev->actually_writable[priority]));
 
     return (count - ret);
 }
@@ -182,9 +191,9 @@ static int dev_open(struct inode *inode, struct file *file)
 	}
     /* set defaults values for new session */
     ((session_data *)file->private_data)->current_priority = LOW_PRIORITY;
-    ((session_data *)file->private_data)->timeout = 999999999;      // (DA CAMBIARE) no timeout
-    ((session_data *)file->private_data)->read_residual = false;    // first attempt to read
-    ((session_data *)file->private_data)->write_residual = false;   // first attempt to write
+    ((session_data *)file->private_data)->timeout = MAX_WAIT_TIMEINT;       // (DA VERIFICARE) no timeout
+    ((session_data *)file->private_data)->read_residual = false;            // first attempt to read
+    ((session_data *)file->private_data)->write_residual = false;           // first attempt to write
 
     if(!try_module_get(THIS_MODULE))
         return -ENODEV;
@@ -226,14 +235,14 @@ ssize_t dev_read(struct file *file, char *buf, size_t count, loff_t *pos)
     if (file->f_flags & O_NONBLOCK) {
         if (!mutex_trylock(&(dev->sync[idx])))
             return -EAGAIN;
-        if (dev->valid_bytes[idx] == 0) {
+        if (atomic_read(&(dev->valid_bytes[idx])) == 0) {
             mutex_unlock(&(dev->sync[idx]));
             return -EAGAIN;
         }
     } else {
 retry_read:
         ret = wait_event_interruptible_timeout(dev->waitq[idx],
-                dev->valid_bytes[idx] > 0 || ((session_data *)file->private_data)->read_residual,
+                atomic_read(&(dev->valid_bytes[idx])) > 0 || ((session_data *)file->private_data)->read_residual,
                 ((session_data *)file->private_data)->timeout);
         printk("%s: reader returned on runqueue with residual value: %d\n", MODNAME, ((session_data *)file->private_data)->read_residual);
         if (ret == 0) {
@@ -244,7 +253,7 @@ retry_read:
         }
         if (!mutex_trylock(&(dev->sync[idx])))
             goto retry_read;
-        if (dev->valid_bytes[idx] == 0) {
+        if (atomic_read(&(dev->valid_bytes[idx])) == 0) {
             mutex_unlock(&(dev->sync[idx]));
             if (((session_data *)file->private_data)->read_residual) {
                 ((session_data *)file->private_data)->read_residual = false;
@@ -279,16 +288,17 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
     if (file->f_flags & O_NONBLOCK) {
         if (!mutex_trylock(&(dev->sync[idx])))
             return -EAGAIN;
-        if (dev->valid_bytes[idx] == MAX_STREAM_SIZE) {            // the stream is full 
+        if (atomic_read(&(dev->actually_writable[idx])) == 0) {     // the stream is full 
             mutex_unlock(&(dev->sync[idx]));
             return -EAGAIN;
         }
     } else {
 retry_write:
+        printk("%s: writer (%d) before wait queue API\n", MODNAME, current->pid);
         ret = wait_event_interruptible_timeout(dev->waitq[idx],
-                dev->valid_bytes[idx] < MAX_STREAM_SIZE || ((session_data *)file->private_data)->write_residual,
+                atomic_read(&(dev->actually_writable[idx])) > 0 || ((session_data *)file->private_data)->write_residual,
                 ((session_data *)file->private_data)->timeout);
-        printk("%s: writer returned on runqueue with residual value: %d\n", MODNAME, ((session_data *)file->private_data)->write_residual);
+        printk("%s: writer (%d) returned on runqueue with residual value: %d\n", MODNAME, current->pid, ((session_data *)file->private_data)->write_residual);
         if (ret == 0) {
             return -ETIME;
         }
@@ -297,7 +307,7 @@ retry_write:
         }
         if (!mutex_trylock(&(dev->sync[idx])))
             goto retry_write;
-        if (dev->valid_bytes[idx] == MAX_STREAM_SIZE) {
+        if (atomic_read(&(dev->actually_writable[idx])) == 0) {
             mutex_unlock(&(dev->sync[idx]));
             if (((session_data *)file->private_data)->write_residual) {
                 ((session_data *)file->private_data)->write_residual = false;
@@ -308,8 +318,8 @@ retry_write:
         ((session_data *)file->private_data)->write_residual = false;
     }
     
-    if ((MAX_STREAM_SIZE - dev->valid_bytes[idx]) < count)      // do partial write
-        count = (MAX_STREAM_SIZE - dev->valid_bytes[idx]);
+    if (atomic_read(&(dev->actually_writable[idx])) < count)      // do partial write
+        count = atomic_read(&(dev->actually_writable[idx]));
 
     if (idx == HIGH_PRIORITY) {
         printk("%s: somebody called an high priority write on dev with [major,minor] number [%d,%d]\n",MODNAME,get_major(file),get_minor(file));
@@ -349,11 +359,13 @@ retry_write:
         count = MAX_STREAM_SIZE;
     ret = copy_from_user(work_container->buf, buf, count);
 
-    work_container->count = count - ret;
+    work_container->count = (count - ret);
     work_container->real_write = actual_write;
     
     __INIT_WORK(&(work_container->the_work), (void *)deferred_write, (unsigned long)(&(work_container->the_work)));
     queue_work(dev->wr_workq, &work_container->the_work);
+    atomic_sub((count - ret), &(dev->actually_writable[idx]));
+    
     mutex_unlock(&(dev->sync[idx]));
 
     return (count - ret);
@@ -361,6 +373,7 @@ retry_write:
 
 static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    long __user *argp = (long __user *)arg;
     long ret;
 
     printk("%s: somebody called a ioctl on dev with [major,minor] number [%d,%d] and command %d\n",MODNAME,get_major(file),get_minor(file),cmd);
@@ -379,6 +392,17 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         else
             file->f_flags |= O_NONBLOCK;
         ret = 0;
+        break;
+    case SET_WAIT_TIMEINT_IOCTL:
+        if (copy_from_user(&ret, argp, sizeof(ret)) != 0)
+            return -EBADTYPE;   // the argument is not a long
+        if (ret <= 0)
+            return -EINVAL;     // invalid argument
+        ret *= HZ;
+        if (ret > MAX_WAIT_TIMEINT)
+            ((session_data *)file->private_data)->timeout = ret = MAX_WAIT_TIMEINT;
+        else
+            ((session_data *)file->private_data)->timeout = ret;
         break;
 
     default:
@@ -418,7 +442,8 @@ int multi_flow_dev_init(void)
             init_waitqueue_head(&(devices[i].waitq[j]));
             mutex_init(&(devices[i].sync[j]));
             devices[i].start[j] = 0;
-            devices[i].valid_bytes[j] = 0;
+            atomic_set(&(devices[i].valid_bytes[j]), 0);
+            atomic_set(&(devices[i].actually_writable[j]), MAX_STREAM_SIZE);
             devices[i].streams[j] = NULL;
             devices[i].streams[j] = (char *)get_zeroed_page(GFP_KERNEL);
             if(devices[i].streams[j] == NULL)
