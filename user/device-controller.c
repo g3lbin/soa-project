@@ -12,6 +12,10 @@ char buff[4096];
 #define DATA_HIGH "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 #define SIZE_HIGH strlen(DATA_HIGH)
 
+#define IOC_SWITCH_PRIORITY     _IO('r', 0x20)
+#define IOC_SWITCH_BLOCKING     _IO('r', 0x21)
+#define IOC_SET_WAIT_TIMEINT    _IOW('r', 0x22, long *)
+
 void * the_thread(void *path){
 	char *device;
 	int fd = -1;
@@ -87,12 +91,12 @@ void * the_thread(void *path){
 
             break;
         case 5:
-            ret = ioctl(fd, 0);
+            ret = ioctl(fd, IOC_SWITCH_PRIORITY);
             if (ret < 0)
                 printf("(%d) impossible to change priority level for device '%s'\n", ret, device);
             break;
         case 6:
-            ret = ioctl(fd, 1);
+            ret = ioctl(fd, IOC_SWITCH_BLOCKING);
             if (ret < 0)
                 printf("(%d) impossible to switch blocking operations mode for device '%s'\n", ret, device);
             break;
@@ -101,7 +105,7 @@ void * the_thread(void *path){
             scanf("%ld", &timeout);
             while (getchar() != '\n');
 
-            ret = ioctl(fd, 2, &timeout);
+            ret = ioctl(fd, IOC_SET_WAIT_TIMEINT, &timeout);
             if (ret < 0)
                 printf("(%d) impossible to set wait timeout interval for device '%s'\n", ret, device);
             break;
