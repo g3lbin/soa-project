@@ -49,6 +49,7 @@ void * the_thread(void *path){
         while (getchar() != '\n');
 
         memset(bytes, 0x0, sizeof(bytes));
+        ret = 0;
         num = 0;
         switch (op)
         {
@@ -87,8 +88,7 @@ void * the_thread(void *path){
             if (ret < 0)
                 printf("(%d) read on device '%s' failed\n\n", ret, device);
             else
-                printf("read bytes are the following:\n%s\n\n", bytes);
-
+                printf("read %d bytes:\n%s\n\n", ret, bytes);
             break;
         case 5:
             ret = ioctl(fd, IOC_SWITCH_PRIORITY);

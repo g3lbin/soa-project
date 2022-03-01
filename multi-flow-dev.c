@@ -12,6 +12,8 @@
 #include <linux/workqueue.h>
 #include <linux/string.h>
 #include <linux/wait.h>
+#include <linux/moduleparam.h>
+#include <linux/kprobes.h>
 
 #define MODNAME "MULTI-FLOW DEV"
 #define DEVICE_NAME "multi-flow-dev"
@@ -26,13 +28,15 @@
 #define LOW_PRIORITY (0)
 #define HIGH_PRIORITY (1)
 
-#define MAX_STREAM_SIZE (4096)        // just one page: 4KB
-#define MAX_WAIT_TIMEINT (999999999L) // represent infinite time in jiffies
+#define MAX_STREAM_SIZE (4096)          // just one page: 4KB
+#define MAX_WAIT_TIMEINT (999999999L)   // represent infinite time in jiffies
 
 #define IOC_MAGIC 'r' // https://www.kernel.org/doc/Documentation/ioctl/ioctl-number.txt
 #define IOC_SWITCH_PRIORITY _IO(IOC_MAGIC, 0x20)
 #define IOC_SWITCH_BLOCKING _IO(IOC_MAGIC, 0x21)
 #define IOC_SET_WAIT_TIMEINT _IOW(IOC_MAGIC, 0x22, long *)
+
+#define CHARP_ENTRY_SIZE 32             // number of bytes reserved for each entry of charp array parameters
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
 #define get_major(session) MAJOR(session->f_inode->i_rdev)
@@ -56,6 +60,18 @@
         __ret;                                        \
     })
 
+#define mfd_module_param_array_named(name, array, type, nump, perm)		\
+	param_check_##type(name, &((char **)array)[0]);				        \
+	static const struct kparam_array __param_arr_##name		            \
+	= { .max = ARRAY_SIZE(array), .num = nump,                          \
+	    .ops = &mfd_param_ops_##type,					                \
+	    .elemsize = sizeof(array[0]), .elem = array };		            \
+	__module_param_call(MODULE_PARAM_PREFIX, name,			            \
+			    &mfd_param_array_ops,				                    \
+			    .arr = &__param_arr_##name,			                    \
+			    perm, -1, 0);				                            \
+	__MODULE_PARM_TYPE(name, "array of " #type)
+
 typedef struct _device_struct
 {
     wait_queue_head_t waitq[PRIORITIES];    // for blocking read and write operations
@@ -65,14 +81,13 @@ typedef struct _device_struct
     atomic_t valid_bytes[PRIORITIES];       // valid bytes of each stream
     atomic_t actually_writable[PRIORITIES]; // free space to execute write operations
     char *streams[PRIORITIES];              // streams' addresses
+    atomic_t waiting_threads[PRIORITIES];   // number of threads currently waiting for data along the two flows
 } device_struct;
 
 typedef struct _session_data
 {
     short current_priority; // priority level for the operation
     long timeout;           // timeout in jiffies to break the wait
-    bool read_residual;     // to distinguish the first attempt to read from the following
-    bool write_residual;    // to distinguish the first attempt to write from the following
 } session_data;
 
 typedef struct _packed_write
@@ -83,7 +98,7 @@ typedef struct _packed_write
     short priority;
     char *buf;
     size_t count;
-    ssize_t (*real_write)(short, device_struct *, const char *, size_t);
+    ssize_t (*real_write)(short, int, const char *, size_t);
 } packed_write;
 
 static int dev_open(struct inode *, struct file *);
@@ -92,16 +107,70 @@ static ssize_t dev_read(struct file *, char *, size_t, loff_t *);
 static ssize_t dev_write(struct file *, const char *, size_t, loff_t *);
 static long dev_ioctl(struct file *, unsigned int, unsigned long);
 void deferred_write(unsigned long);
-ssize_t actual_write(short, device_struct *, const char *, size_t);
+ssize_t actual_write(short, int, const char *, size_t);
+ssize_t actual_read(short, int, char *, size_t);
 
-static int Major; // major number assigned to broadcast device driver
-device_struct devices[MINORS];
+static int major;                                           // major number assigned to the device driver
+static device_struct devices[MINORS];
+static int arr_size = MINORS;
+
+/* module parameters hook */
+static int mfd_param_get_charp(char *buffer, const struct kernel_param *kp)
+{
+    device_struct *dev;
+    
+    if (strncmp(kp->name, "bytes_present_on_devices_streams",
+            strlen("bytes_present_on_devices_streams")) == 0) {
+        dev = devices + (long)kp->arg;
+        return scnprintf(buffer, PAGE_SIZE, "dev[%ld] - high:%d,low:%d\n", (long)kp->arg,
+            atomic_read(&(dev->valid_bytes[HIGH_PRIORITY])),
+            atomic_read(&(dev->valid_bytes[LOW_PRIORITY])));
+    } else if (strncmp(kp->name, "waiting_threads_on_devices_streams",
+            strlen("waiting_threads_on_devices_streams")) == 0) {
+            dev = devices + (long)kp->arg;
+        return scnprintf(buffer, PAGE_SIZE, "dev[%ld] - high:%d,low:%d\n", (long)kp->arg,
+            atomic_read(&(dev->waiting_threads[HIGH_PRIORITY])),
+            atomic_read(&(dev->waiting_threads[LOW_PRIORITY])));
+    } else {
+        return scnprintf(buffer, PAGE_SIZE, "%s\n", *((char **)kp->arg));
+    }
+}
+
+static int mfd_param_array_get(char *buffer, const struct kernel_param *kp)
+{
+	int i, off, ret;
+	const struct kparam_array *arr = kp->arr;
+	struct kernel_param p = *kp;
+
+	for (i = off = 0; i < (arr->num ? *arr->num : arr->max); i++) {
+		p.arg = (void *)(long)i;
+		ret = arr->ops->get(buffer + off, &p);
+		if (ret < 0)
+			return ret;
+		off += ret;
+	}
+	buffer[off] = '\0';
+	return off;
+}
+
+static const struct kernel_param_ops mfd_param_array_ops = {
+	.get = mfd_param_array_get,
+};
+
+static const struct kernel_param_ops mfd_param_ops_charp = 
+{
+    .get = &mfd_param_get_charp,
+};
+
+
 /* Module parameters */
-int arr_size = MINORS;
-int device_status[MINORS];
-module_param_array(device_status, int, &arr_size, 0660);
-// atomic_t valid_bytes[MINORS][PRIORITIES] = {0};
-// atomic_t waiting_threads[MINORS][PRIORITIES] = {0};
+static int device_status[MINORS];
+static char bytes_present[MINORS][32];
+static char waiting_threads[MINORS][32];
+
+module_param_array(device_status, int, &arr_size, S_IRUGO | S_IWUSR);
+mfd_module_param_array_named(bytes_present_on_devices_streams, bytes_present, charp, &arr_size, S_IRUGO);
+mfd_module_param_array_named(waiting_threads_on_devices_streams, waiting_threads, charp, &arr_size, S_IRUGO);
 
 /* Internal functions */
 
@@ -117,7 +186,7 @@ void deferred_write(unsigned long data)
     dev = devices + wr_info->minor;
 
     mutex_lock(&(dev->sync[wr_info->priority]));
-    (wr_info->real_write)(wr_info->priority, dev, wr_info->buf, wr_info->count);
+    (wr_info->real_write)(wr_info->priority, wr_info->minor, wr_info->buf, wr_info->count);
     wake_up_interruptible(&(dev->waitq[wr_info->priority]));
     mutex_unlock(&(dev->sync[wr_info->priority]));
 
@@ -126,11 +195,12 @@ void deferred_write(unsigned long data)
     module_put(THIS_MODULE);
 }
 
-ssize_t actual_write(short priority, device_struct *dev, const char *buf, size_t count)
+ssize_t actual_write(short priority, int minor, const char *buf, size_t count)
 {
     short ret;
     short amount;
     int first_free_byte;
+    device_struct *dev = devices + minor;
 
     first_free_byte = (dev->start[priority] + atomic_read(&(dev->valid_bytes[priority]))) % MAX_STREAM_SIZE;
     if (count > (MAX_STREAM_SIZE - first_free_byte))
@@ -156,10 +226,11 @@ ssize_t actual_write(short priority, device_struct *dev, const char *buf, size_t
     return (count - ret);
 }
 
-ssize_t actual_read(short priority, device_struct *dev, char *buf, size_t count)
+ssize_t actual_read(short priority, int minor, char *buf, size_t count)
 {
     short ret;
     short amount;
+    device_struct *dev = devices + minor;
 
     if ((ret = (short)atomic_read(&(dev->valid_bytes[priority]))) < count)
         count = ret;
@@ -213,8 +284,6 @@ static int dev_open(struct inode *inode, struct file *file)
     /* set defaults values for new session */
     ((session_data *)file->private_data)->current_priority = LOW_PRIORITY;
     ((session_data *)file->private_data)->timeout = MAX_WAIT_TIMEINT; // (DA VERIFICARE) no timeout
-    ((session_data *)file->private_data)->read_residual = false;      // first attempt to read
-    ((session_data *)file->private_data)->write_residual = false;     // first attempt to write
 
     if (!try_module_get(THIS_MODULE))
         return -ENODEV;
@@ -265,37 +334,27 @@ ssize_t dev_read(struct file *file, char *buf, size_t count, loff_t *pos)
     }
     else
     {
+        atomic_inc(&(dev->waiting_threads[idx]));
     retry_read:
         ret = wait_event_interruptible_timeout(dev->waitq[idx],
-                                               atomic_read(&(dev->valid_bytes[idx])) > 0 || ((session_data *)file->private_data)->read_residual,
-                                               ((session_data *)file->private_data)->timeout);
-        printk("%s: reader returned on runqueue with residual value: %d\n", MODNAME, ((session_data *)file->private_data)->read_residual);
-        if (ret == 0)
-        {
+                atomic_read(&(dev->valid_bytes[idx])) > 0,
+                ((session_data *)file->private_data)->timeout);
+        printk("%s: reader returned on runqueue\n", MODNAME);
+        if (ret == 0) {
             return -ETIME;
         }
-        if (ret == -ERESTARTSYS)
-        {
+        if (ret == -ERESTARTSYS) {
             return -EINTR;
         }
         if (!mutex_trylock(&(dev->sync[idx])))
             goto retry_read;
-        if (atomic_read(&(dev->valid_bytes[idx])) == 0)
-        {
+        if (atomic_read(&(dev->valid_bytes[idx])) == 0) {
             mutex_unlock(&(dev->sync[idx]));
-            if (((session_data *)file->private_data)->read_residual)
-            {
-                ((session_data *)file->private_data)->read_residual = false;
-                return 0; // no bytes left on current device stream
-            }
-            goto retry_read; // someone has read the bytes before you
+            goto retry_read;                    // someone has read the bytes before you
         }
-        ((session_data *)file->private_data)->read_residual = false;
     }
-
-    ret = actual_read(idx, dev, buf, count);
-    if (ret < count)
-        ((session_data *)file->private_data)->read_residual = true;
+    atomic_dec(&(dev->waiting_threads[idx]));
+    ret = actual_read(idx, get_minor(file), buf, count);
 
     wake_up_interruptible(&(dev->waitq[idx]));
     mutex_unlock(&(dev->sync[idx]));
@@ -329,30 +388,21 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
     retry_write:
         printk("%s: writer (%d) before wait queue API\n", MODNAME, current->pid);
         ret = wait_event_interruptible_timeout(dev->waitq[idx],
-                                               atomic_read(&(dev->actually_writable[idx])) > 0 || ((session_data *)file->private_data)->write_residual,
+                                               atomic_read(&(dev->actually_writable[idx])) > 0,
                                                ((session_data *)file->private_data)->timeout);
-        printk("%s: writer (%d) returned on runqueue with residual value: %d\n", MODNAME, current->pid, ((session_data *)file->private_data)->write_residual);
-        if (ret == 0)
-        {
+        printk("%s: writer (%d) returned on runqueue\n", MODNAME, current->pid);
+        if (ret == 0) {
             return -ETIME;
         }
-        if (ret == -ERESTARTSYS)
-        {
+        if (ret == -ERESTARTSYS) {
             return -EINTR;
         }
         if (!mutex_trylock(&(dev->sync[idx])))
             goto retry_write;
-        if (atomic_read(&(dev->actually_writable[idx])) == 0)
-        {
+        if (atomic_read(&(dev->actually_writable[idx])) == 0) {
             mutex_unlock(&(dev->sync[idx]));
-            if (((session_data *)file->private_data)->write_residual)
-            {
-                ((session_data *)file->private_data)->write_residual = false;
-                return 0; // no bytes left on current device stream
-            }
             goto retry_write; // someone has write before you
         }
-        ((session_data *)file->private_data)->write_residual = false;
     }
 
     if (atomic_read(&(dev->actually_writable[idx])) < count) // do partial write
@@ -361,7 +411,7 @@ ssize_t dev_write(struct file *file, const char *buf, size_t count, loff_t *pos)
     if (idx == HIGH_PRIORITY)
     {
         printk("%s: somebody called an high priority write on dev with [major,minor] number [%d,%d]\n", MODNAME, get_major(file), get_minor(file));
-        ret = actual_write(idx, dev, buf, count);
+        ret = actual_write(idx, get_minor(file), buf, count);
         wake_up_interruptible(&(dev->waitq[idx]));
         mutex_unlock(&(dev->sync[idx]));
 
@@ -490,6 +540,7 @@ int multi_flow_dev_init(void)
             devices[i].start[j] = 0;
             atomic_set(&(devices[i].valid_bytes[j]), 0);
             atomic_set(&(devices[i].actually_writable[j]), MAX_STREAM_SIZE);
+            atomic_set(&(devices[i].waiting_threads[j]), 0);
             devices[i].streams[j] = NULL;
             devices[i].streams[j] = (char *)get_zeroed_page(GFP_KERNEL);
             if (devices[i].streams[j] == NULL)
@@ -497,14 +548,14 @@ int multi_flow_dev_init(void)
         }
     }
 
-    Major = __register_chrdev(0, 0, 256, DEVICE_NAME, &fops);
+    major = __register_chrdev(0, 0, 256, DEVICE_NAME, &fops);
 
-    if (Major < 0)
+    if (major < 0)
     {
         printk("%s: registering device failed\n", MODNAME);
-        return Major;
+        return major;
     }
-    printk(KERN_INFO "%s: new device registered, it is assigned major number %d\n", MODNAME, Major);
+    printk(KERN_INFO "%s: new device registered, it is assigned major number %d\n", MODNAME, major);
 
     return 0;
 
@@ -535,9 +586,9 @@ void multi_flow_dev_cleanup(void)
         }
     }
 
-    unregister_chrdev(Major, DEVICE_NAME);
+    unregister_chrdev(major, DEVICE_NAME);
 
-    printk(KERN_INFO "%s: new device unregistered, it was assigned major number %d\n", MODNAME, Major);
+    printk(KERN_INFO "%s: new device unregistered, it was assigned major number %d\n", MODNAME, major);
 
     return;
 }
