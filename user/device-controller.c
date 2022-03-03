@@ -58,9 +58,9 @@ void * the_thread(void *path){
             fd = open(device, O_RDWR);
             if(fd < 0) {
                 printf("(%d) open error on device %s\n", fd, device);
-                return NULL;
+            } else {
+                printf("device %s successfully opened\n\n", device);
             }
-            printf("device %s successfully opened\n\n", device);
             break;
         case 2:
             printf("device %s successfully closed\n\n", device);
