@@ -6,32 +6,36 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 
+#include "../mfdlib/ioctl.h"
+
 char buff[4096];
-#define DATA_LOW "abcdefghijklmnopqrstuvwxyz"
-#define SIZE_LOW strlen(DATA_LOW)
-#define DATA_HIGH "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-#define SIZE_HIGH strlen(DATA_HIGH)
 
-#define IOC_SWITCH_PRIORITY     _IO('r', 0x20)
-#define IOC_SWITCH_BLOCKING     _IO('r', 0x21)
-#define IOC_SET_WAIT_TIMEINT    _IOW('r', 0x22, long *)
+void int_to_priority(char *buf, int prio)
+{
+    memset(buf, 0x0, sizeof(buf));
+    if (prio)
+        sprintf(buf, "high");
+    else
+        sprintf(buf, "low");
+}
 
-void * the_thread(void *path){
+void *the_thread(void *path)
+{
 	char *device;
 	int fd = -1;
     int op;
 	int ret;
     int num;
     int ch;
+    long jiffies;
     long timeout;
 	char command[256];
     char bytes[4100];
+    char prio_str[8];
+    int priority = 0;
 
 	device = (char *)path;
-	sleep(1);
-
-	memset(command, 0x0, strlen(command));
-	sprintf(command, "echo '\n' && cat %s\n", device);
+    int_to_priority(prio_str, priority);
 
     while(1) {
         system("clear\n");
@@ -43,7 +47,8 @@ void * the_thread(void *path){
         printf("5) Switch to low or high priority flow for the device\n");
         printf("6) Switch to blocking or non-blocking read and write operations\n");
         printf("7) Set a new time interval for blocking read and write operations\n");
-		printf("8) Quit\n");
+		printf("8) Quit\n\n");
+        printf("Enter the code of a command and press 'Enter'\n");
 
         scanf("%d", &op);
         while (getchar() != '\n');
@@ -59,7 +64,10 @@ void * the_thread(void *path){
             if(fd < 0) {
                 printf("(%d) open error on device %s\n", fd, device);
             } else {
-                printf("device %s successfully opened\n\n", device);
+                printf("device %s successfully opened with the following characteristics:\n", device);
+                printf("- you are working on %s priority data stream\n", prio_str);
+                printf("- you are working with blocking read and write operations\n");
+                printf("- timeout for blocking operations is set to infinite value\n\n");
             }
             break;
         case 2:
@@ -68,7 +76,8 @@ void * the_thread(void *path){
             fd = -1;
             break;
         case 3:
-            printf("insert the bytes which should be written:\n");
+            printf("insert the bytes which should be written on %s priority data stream:\n",
+                    prio_str);
             num = 0;
             while ((ch = getchar()) != '\n' && ch != EOF) {
                 bytes[num++] = ch;
@@ -78,10 +87,12 @@ void * the_thread(void *path){
             if (ret < 0)
                 printf("(%d) write on device '%s' failed\n\n", ret, device);
             else
-                printf("writed %d bytes on high priority stream of device %s\n\n", ret, device);
+                printf("writed %d bytes on %s priority data stream of device %s\n\n",
+                        ret, prio_str, device);
             break;
         case 4:
-            printf("insert the number of bytes which should be read:\n");
+            printf("insert the number of bytes which should be read from %s priority data stream:\n",
+                    prio_str);
             scanf("%d", &num);
             while (getchar() != '\n');
             ret = read(fd, bytes, num);
@@ -92,22 +103,31 @@ void * the_thread(void *path){
             break;
         case 5:
             ret = ioctl(fd, IOC_SWITCH_PRIORITY);
-            if (ret < 0)
+            if (ret < 0) {
                 printf("(%d) impossible to change priority level for device '%s'\n", ret, device);
+            } else {
+                priority = ret;
+                int_to_priority(prio_str, ret);
+                printf("now you are working on %s priority data stream\n", prio_str);
+            }
             break;
         case 6:
             ret = ioctl(fd, IOC_SWITCH_BLOCKING);
             if (ret < 0)
                 printf("(%d) impossible to switch blocking operations mode for device '%s'\n", ret, device);
+            else
+                printf("now you are working with %s read and write operations\n", (ret ? "non-blocking" : "blocking"));
             break;
         case 7:
-            printf("insert the new timeout value:\n");
+            printf("insert the new timeout interval value (in seconds):\n");
             scanf("%ld", &timeout);
             while (getchar() != '\n');
 
-            ret = ioctl(fd, IOC_SET_WAIT_TIMEINT, &timeout);
-            if (ret < 0)
-                printf("(%d) impossible to set wait timeout interval for device '%s'\n", ret, device);
+            jiffies = ioctl(fd, IOC_SET_WAIT_TIMEINT, &timeout);
+            if (jiffies < 0)
+                printf("(%ld) impossible to set wait timeout interval for device '%s'\n", jiffies, device);
+            else
+                printf("now the maximum wait for blocking operations is %ld jiffies\n", jiffies);
             break;
         default:
             system("clear\n");

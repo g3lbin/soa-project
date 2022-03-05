@@ -12,7 +12,7 @@
 #define MINORS          (128)           // the device driver supports 128 devices
 #define AUDIT           if(1)
 
-/* uncomment the following line if you want just one session per I/O node at a time */
+/* Uncomment the following line if you want just one session per I/O node at a time */
 // #define SINGLE_SESSION_OBJECT
 
 #define DEV_ENABLED     (1)             // operating status of the enabled device
@@ -35,29 +35,6 @@
 #define get_major(session) MAJOR(session->f_dentry->d_inode->i_rdev)
 #define get_minor(session) MINOR(session->f_dentry->d_inode->i_rdev)
 #endif
-
-/**
- * do_write - writes up to count bytes from src to dest
- * @prio: the data flow priority
- * @dest: the destination buffer
- * @src: the source buffer
- * @count: the number of bytes you hope to write
- * 
- * If @prio is LOW_PRIORITY, the @src buffer is located in the kernel space.
- * If @prio is HIGH_PRIORITY, the @src buffer is located in the user space,
- * so the writing can be truncated.
- * 
- * Returns the number of unwritten bytes.
- */
-#define do_write(prio, dest, src, count)                        \
-({                                                              \
-        int __ret = 0;                                          \
-        if (prio == LOW_PRIORITY)                               \
-                memcpy(dest, src, count);                       \
-        else                                                    \
-                __ret = copy_from_user(dest, src, count);       \
-        __ret;                                                  \
-})
 
 /**
  * lock_and_check - lock the mutex and check the condition
@@ -156,35 +133,47 @@ struct packed_write {
         ssize_t                 (*real_write)(short, int, const char *, size_t);
 };
 
+/* Driver functions */
 static int      mfd_open(struct inode *, struct file *);
 static int      mfd_release(struct inode *, struct file *);
 static ssize_t  mfd_read(struct file *, char *, size_t, loff_t *);
 static ssize_t  mfd_write(struct file *, const char *, size_t, loff_t *);
 static long     mfd_ioctl(struct file *, unsigned int, unsigned long);
-static void     deferred_write(unsigned long);
+/* Internal driver functions */
+static void     deferred_write(struct work_struct *);
 static ssize_t  actual_write(short, int, const char *, size_t);
 static ssize_t  actual_read(short, int, char *, size_t);
+/* Module parameters hooks */
 static int      mfd_param_get_charp(char *, const struct kernel_param *);
 static int      mfd_param_array_get(char *, const struct kernel_param *);
+/* Helper functions */
+static inline struct packed_write       *to_packed_write(struct work_struct *);
+static __always_inline int              do_write(short, char *, const char *, size_t);
 
+/*
+ * This struct holds the function that is invoked whenever
+ * the value of a charp parameter is requested.
+ */
 static const struct kernel_param_ops mfd_param_ops_charp = {
         .get = &mfd_param_get_charp,
 };
 
+/*
+ * This struct holds the function that is invoked whenever
+ * the value of an array of parameters is requested.
+ */
 static const struct kernel_param_ops mfd_param_array_ops = {
         .get = mfd_param_array_get,
 };
 
-/* global variables */
+/* Global variables */
+static int                      major;                  // major number assigned to the device driver
+static struct device_struct     devices[MINORS];        // the multi-flow device objects
 
-static int major;                               // major number assigned to the device driver
-static struct device_struct devices[MINORS];    // the multi-flow device objects
-
-/* module parameters */
-
-static int device_status[MINORS];                       // can be enabled (1) or disabled (0)
-static char bytes_present[MINORS][CHARP_ENTRY_SIZE];    // bytes present on the devices streams
-static char waiting_for_data[MINORS][CHARP_ENTRY_SIZE]; // waiting threads on the devices streams
+/* Module parameters */
+static int      device_status[MINORS];                          // can be enabled (1) or disabled (0)
+static char     bytes_present[MINORS][CHARP_ENTRY_SIZE];        // bytes present on the devices streams
+static char     waiting_for_data[MINORS][CHARP_ENTRY_SIZE];     // waiting threads on the devices streams
 
 module_param_array(device_status, int, NULL, S_IRUGO | S_IWUSR);
 mfd_module_param_array_named(bytes_present_on_devices_streams,
@@ -192,8 +181,14 @@ mfd_module_param_array_named(bytes_present_on_devices_streams,
 mfd_module_param_array_named(waiting_threads_on_devices_streams,
                              waiting_for_data, charp, NULL, S_IRUGO);
 
-/* module parameters hook */
-
+/**
+ * mfd_param_get_charp - writes a representation of the parameter value
+ * @buffer: the buffer to place the result into
+ * @kp: kernel parameter
+ * 
+ * Returns the number of characters written into @buffer not including
+ * the trailing '\0'.
+ */
 static int mfd_param_get_charp(char *buffer, const struct kernel_param *kp)
 {
         struct device_struct *dev;
@@ -201,8 +196,8 @@ static int mfd_param_get_charp(char *buffer, const struct kernel_param *kp)
         if (strncmp(kp->name, "bytes_present_on_devices_streams", 32) == 0) {
                 dev = devices + (long)kp->arg;
                 return scnprintf(buffer,
-                                 PAGE_SIZE,
-                                 "dev[%ld] - high:%d,low:%d\n",
+                                 CHARP_ENTRY_SIZE,
+                                 "dev[%03ld] - high:%4d, low:%4d\n",
                                  (long)kp->arg,
                                  atomic_read(&(dev->valid_b[HIGH_PRIORITY])),
                                  atomic_read(&(dev->valid_b[LOW_PRIORITY])));
@@ -210,8 +205,8 @@ static int mfd_param_get_charp(char *buffer, const struct kernel_param *kp)
         if (strncmp(kp->name, "waiting_threads_on_devices_streams", 34) == 0) {
                 dev = devices + (long)kp->arg;
                 return scnprintf(buffer,
-                                 PAGE_SIZE,
-                                 "dev[%ld] - high:%d,low:%d\n",
+                                 CHARP_ENTRY_SIZE,
+                                 "dev[%03ld] - high:%4d, low:%4d\n",
                                  (long)kp->arg,
                                  atomic_read(&(dev->waiting_for_data[HIGH_PRIORITY])),
                                  atomic_read(&(dev->waiting_for_data[LOW_PRIORITY])));
@@ -219,6 +214,14 @@ static int mfd_param_get_charp(char *buffer, const struct kernel_param *kp)
         return scnprintf(buffer, PAGE_SIZE, "%s\n", *((char **)kp->arg));
 }
 
+/**
+ * mfd_param_array_get - writes the parameter array value that appears in sysfs
+ * @buffer: the buffer to place the result into
+ * @kp: kernel parameter pointing to the array
+ * 
+ * Returns the number of characters written into @buffer not including
+ * the trailing '\0'.
+ */
 static int mfd_param_array_get(char *buffer, const struct kernel_param *kp)
 {
         int i, off, ret;
@@ -236,16 +239,54 @@ static int mfd_param_array_get(char *buffer, const struct kernel_param *kp)
         return off;
 }
 
-/* internal functions */
+/**
+ * to_packed_write - retrieves the external struct that embeds the work_struct
+ * @work: workqueue item
+ * 
+ * Returns a pointer to packed_write structure.
+ */
+static inline struct packed_write *to_packed_write(struct work_struct *work)
+{
+	return container_of(work, struct packed_write, the_work);
+}
 
-static void deferred_write(unsigned long data)
+/**
+ * do_write - writes up to count bytes from src to dest
+ * @prio: the data flow priority
+ * @dest: the destination buffer
+ * @src: the source buffer
+ * @count: the number of bytes you hope to write
+ * 
+ * If @prio is LOW_PRIORITY, the @src buffer is located in the kernel space.
+ * If @prio is HIGH_PRIORITY, the @src buffer is located in the user space,
+ * so the writing can be truncated.
+ * 
+ * Returns the number of unwritten bytes.
+ */
+static __always_inline int do_write(short prio, char *dest, const char *src, size_t count)
+{
+        int ret = 0;
+
+        if (prio == LOW_PRIORITY)
+                memcpy(dest, src, count);
+        else
+                ret = copy_from_user(dest, src, count);
+        return ret;
+}
+
+/**
+ * deferred_write - performs the asynchronous writing
+ * @work: workqueue item
+ * 
+ * This function is performed by the kworker daemon which
+ * invokes the actual writing of data to the stream.
+ */
+static void deferred_write(struct work_struct *work)
 {
         struct packed_write *wr_info;
         struct device_struct *dev;
 
-        wr_info = (struct packed_write *)container_of((void *)data,
-                                                     struct packed_write,
-                                                     the_work);
+        wr_info = to_packed_write(work);
         AUDIT
         printk("%s: kworker (%d) processes a low prio write on dev with [major,minor] number [%d,%d]\n",
                MODNAME, current->pid, major, wr_info->minor);
@@ -266,6 +307,17 @@ static void deferred_write(unsigned long data)
         return;
 }
 
+/**
+ * actual_write - performs actual writing of data to the stream
+ * @prio: priority level of the write operation
+ * @minor: device's minor number
+ * @buf: temporary buffer
+ * @count: the number of bytes you hope to write
+ * 
+ * Note: the @buf temporary buffer can be in kernel space or user space.
+ * 
+ * Returns the number of characters written within the stream.
+ */
 static ssize_t actual_write(short prio, int minor, const char *buf, size_t count)
 {
         int ret;
@@ -275,8 +327,8 @@ static ssize_t actual_write(short prio, int minor, const char *buf, size_t count
 
         first_free_b = (dev->start[prio] + atomic_read(&(dev->valid_b[prio])))
                         % MAX_STREAM_SIZE;
-
-        if (count > (MAX_STREAM_SIZE - first_free_b)) {         // due to the circularity of the buffer
+        /* Due to the circularity of the buffer */
+        if (count > (MAX_STREAM_SIZE - first_free_b)) {
                 amount = (MAX_STREAM_SIZE - first_free_b);
                 ret = do_write(prio,
                                dev->streams[prio] + first_free_b,
@@ -298,6 +350,15 @@ static ssize_t actual_write(short prio, int minor, const char *buf, size_t count
         return (count - ret);
 }
 
+/**
+ * actual_read - performs the actual reading of the data from the stream
+ * @prio: priority level of the read operation
+ * @minor: device's minor number
+ * @buf: buffer corresponding to device stream
+ * @count: the number of bytes you hope to read
+ * 
+ * Returns the number of characters read from the stream.
+ */
 ssize_t actual_read(short prio, int minor, char *buf, size_t count)
 {
         int ret;
@@ -306,8 +367,8 @@ ssize_t actual_read(short prio, int minor, char *buf, size_t count)
 
         if ((ret = atomic_read(&(dev->valid_b[prio]))) < count)
                 count = ret;
-
-        if (count > (MAX_STREAM_SIZE - dev->start[prio])) {         // due to the circularity of the buffer
+        /* Due to the circularity of the buffer */
+        if (count > (MAX_STREAM_SIZE - dev->start[prio])) {
                 amount = (MAX_STREAM_SIZE - dev->start[prio]);
                 ret = copy_to_user(buf,
                                    dev->streams[prio] + dev->start[prio],
@@ -328,12 +389,12 @@ ssize_t actual_read(short prio, int minor, char *buf, size_t count)
         return (count - ret);
 }
 
-/* the actual driver */
-
 /**
  * mfd_open - open the multi-flow device file with f_flags initialized
- * @inode: device file I/O metadata
- * @file: device file I/O session
+ * @inode: I/O metadata of the device file
+ * @file: I/O session to the device file
+ * 
+ * Returns 0 if the operation is successful, otherwise a negative value.
  */
 static int mfd_open(struct inode *inode, struct file *file)
 {
@@ -362,15 +423,17 @@ static int mfd_open(struct inode *inode, struct file *file)
         session->current_priority = LOW_PRIORITY;
         session->timeout = MAX_WAIT_TIMEINT;            // no timeout
         AUDIT
-        printk("%s: device file successfully opened for object with minor %d\n",
-               MODNAME, minor);
+        printk("%s: device file successfully opened for object with [major,minor] number [%d,%d]\n",
+               MODNAME, get_major(file), get_minor(file));
         return 0;
 }
 
 /**
  * mfd_release - release the multi-flow device file
- * @inode: device file I/O metadata
- * @file: device file I/O session
+ * @inode: I/O metadata of the device file
+ * @file: I/O session to the device file
+ * 
+ * Returns 0
  */
 static int mfd_release(struct inode *inode, struct file *file)
 {
@@ -380,18 +443,24 @@ static int mfd_release(struct inode *inode, struct file *file)
 #endif
         kfree(file->private_data);
         AUDIT
-        printk("%s: device file closed for object with minor %d\n",
-               MODNAME, get_minor(file));
+        printk("%s: device file closed for object with dev with [major,minor] number [%d,%d]\n",
+               MODNAME, get_major(file), get_minor(file));
         return 0;
 }
 
 /**
- * mfd_read - attempts to read up to count bytes from multi-flow device file into the buffer starting at buf
- * read almost count bytes from multi-flow device file in FIFO order
- * @file: device file I/O session
- * @buf:
- * @count: 
+ * mfd_read - attempts to read up to count bytes from multi-flow device file
+ * @file: I/O session to the device file
+ * @buf: destination buffer
+ * @count: the number of bytes you hope to read
  * @pos: unused
+ * 
+ * Data delivery follows a First-in-First-out policy, so after the read 
+ * operations, the read data disappears from the stream.
+ * 
+ * Note: read operations are all executed synchronously.
+ * 
+ * Returns the number of characters read from the stream.
  */
 ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *pos)
 {
@@ -407,9 +476,9 @@ ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *pos)
         idx = session->current_priority;
 
         if (file->f_flags & O_NONBLOCK) {
-                if (!mutex_trylock(&(dev->sync[idx])))
+                if (!mutex_trylock(&(dev->sync[idx])))          // busy
                         return -EAGAIN;
-                if (atomic_read(&(dev->valid_b[idx])) == 0) {
+                if (atomic_read(&(dev->valid_b[idx])) == 0) {   // the stream is empty
                         mutex_unlock(&(dev->sync[idx]));
                         return -EAGAIN;
                 }
@@ -419,10 +488,14 @@ ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *pos)
                                 lock_and_check(atomic_read(&(dev->valid_b[idx])) > 0,
                                                &(dev->sync[idx])),
                                 session->timeout);
-                if (ret == 0)
+                if (ret == 0) {
+                        atomic_dec(&(dev->waiting_for_data[idx]));
                         return -ETIME;
-                if (ret == -ERESTARTSYS)
+                }
+                if (ret == -ERESTARTSYS) {
+                        atomic_dec(&(dev->waiting_for_data[idx]));
                         return -EINTR;
+                }
         }
         atomic_dec(&(dev->waiting_for_data[idx]));
         ret = actual_read(idx, get_minor(file), buf, count);
@@ -431,6 +504,22 @@ ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *pos)
         return (ssize_t)ret;
 }
 
+/**
+ * mfd_write - attempts to write up to count bytes from multi-flow device file
+ * @file: I/O session to the device file
+ * @buf: source buffer
+ * @count: the number of bytes you hope to write
+ * @pos: unused
+ * 
+ * Data delivery follows a First-in-First-out policy, so the data is written
+ * at the end of those already present.
+ * 
+ * Note: the write operation on the high priority data stream is synchronous,
+ * while the one on the low priority data stream is asynchronous, but still
+ * keeping the interface able to synchronously notify the outcome.
+ * 
+ * Returns the number of characters written to the stream.
+ */
 ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *pos)
 {
         long ret;
@@ -445,9 +534,9 @@ ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *pos)
                 MODNAME, get_major(file), get_minor(file));
 
         if (file->f_flags & O_NONBLOCK) {
-                if (!mutex_trylock(&(dev->sync[idx])))
+                if (!mutex_trylock(&(dev->sync[idx])))          // busy
                         return -EAGAIN;
-                if (atomic_read(&(dev->free_b[idx])) == 0) {  // the stream is full
+                if (atomic_read(&(dev->free_b[idx])) == 0) {    // the stream is full
                         mutex_unlock(&(dev->sync[idx]));
                         return -EAGAIN;
                 }
@@ -470,21 +559,21 @@ ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *pos)
                 mutex_unlock(&(dev->sync[idx]));
                 return ret;
         }
-        /* schedule deferred work */
+        /* Schedule deferred work */
         if (!try_module_get(THIS_MODULE)) {
                 mutex_unlock(&(dev->sync[idx]));
                 return -ENODEV;
         }
         if (file->f_flags & O_NONBLOCK)
-                mask |= GFP_ATOMIC; // non blocking memory allocation
+                mask |= GFP_ATOMIC; // non-blocking memory allocation
         container = (struct packed_write *)kzalloc(sizeof(struct packed_write),
-                                                  mask);
+                                                   mask);
         if (!container) {
                 mutex_unlock(&(dev->sync[idx]));
                 module_put(THIS_MODULE);
                 return -ENOMEM;
         }
-        /* fill struct packed_write */
+        /* Fill struct packed_write */
         container->minor = get_minor(file);
         container->buf = (char *)get_zeroed_page(mask);
         if (!container->buf) {
@@ -499,7 +588,7 @@ ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *pos)
         container->count = (count - ret);
         container->real_write = actual_write;
         __INIT_WORK(&(container->the_work),
-                    (void *)deferred_write,
+                    deferred_write,
                     (unsigned long)(&(container->the_work)));
         queue_work(dev->wr_workq, &container->the_work);
         atomic_sub((count - ret), &(dev->free_b[idx]));
@@ -507,6 +596,19 @@ ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *pos)
         return (count - ret);
 }
 
+/**
+ * mfd_ioctl - handles the I/O control requests
+ * @file: I/O session to the device file
+ * @cmd: IOCTL command code
+ * @arg: command argument
+ * 
+ * Returns:
+ * the current priority level after changing it if @cmd is IOC_SWITCH_PRIORITY,
+ * the status of O_NONBLOCK flag after changing it if @cmd is IOC_SWITCH_BLOCKING,
+ * the timeout interval in jiffies after setting it if @cmd is IOC_SET_WAIT_TIMEINT,
+ * -EINVAL if @arg is not valid,
+ * -ENOTTY if @cmd is not valid.
+ */
 static long mfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
         long __user *argp = (long __user *)arg;
@@ -530,13 +632,15 @@ static long mfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                         file->f_flags ^= O_NONBLOCK;
                 else
                         file->f_flags |= O_NONBLOCK;
+                ret = (file->f_flags & O_NONBLOCK);
                 break;
         case IOC_SET_WAIT_TIMEINT:
                 if (copy_from_user(&ret, argp, sizeof(ret)) != 0)
-                        return -EBADTYPE;       // the argument is not a long
+                        return -EINVAL;
                 if (ret <= 0)
-                        return -EINVAL;         // invalid argument
-                ret *= HZ;                      // convert secs in jiffies
+                        return -EINVAL;
+                /* Convert secs in jiffies */
+                ret *= HZ;
                 if (ret > MAX_WAIT_TIMEINT)
                         session->timeout = ret = MAX_WAIT_TIMEINT;
                 else
@@ -550,19 +654,38 @@ static long mfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return ret;
 }
 
+/*
+ * This struct holds the functions that make up the character device driver.
+ */
 static struct file_operations fops = {
-        .owner = THIS_MODULE,
-        .write = mfd_write,
-        .read = mfd_read,
-        .open = mfd_open,
-        .release = mfd_release,
+        .owner          = THIS_MODULE,
+        .write          = mfd_write,
+        .read           = mfd_read,
+        .open           = mfd_open,
+        .release        = mfd_release,
         .unlocked_ioctl = mfd_ioctl
 };
 
+/**
+ * multi_flow_dev_init - does the module initialization
+ * 
+ * This function performs the needed memory allocations and initializations of
+ * multi-flow devices informations.
+ * 
+ * Note: by default, each device is equipped with a buffer for high priority and
+ * one for low priority operations, both with a size equal to PAGE_SIZE.
+ * 
+ * Returns 0 if initialization is successful, otherwise a negative value.
+ */
 int multi_flow_dev_init(void)
 {
         int i, j, k;
         char queue_name[WQ_NAME_LENGTH];
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0)
+        pr_err("%s: kernel version no longer supported\n", MODNAME);
+        return -1;
+#endif
 
         /* initialize the drive internal state */
         for (i = 0; i < MINORS; i++) {
@@ -606,13 +729,15 @@ revert_allocation:
                 destroy_workqueue(devices[i].wr_workq);
                 for (k = 0; k < STREAMS_NUM; k++) {
                         free_page((unsigned long)devices[i].streams[k]);
-                        if (i == 0 && k == j)
-                                break;
+                        if (i == 0 && k == j) break;
                 }
         }
         return -ENOMEM;
 }
 
+/**
+ * multi_flow_dev_cleanup - does the module cleanup
+ */
 void multi_flow_dev_cleanup(void)
 {
         int i, k;
