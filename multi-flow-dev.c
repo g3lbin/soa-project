@@ -10,7 +10,6 @@
 #define MODNAME         "MULTI-FLOW DEV"
 #define DEVICE_NAME     "multi-flow-dev"
 #define MINORS          (128)           // the device driver supports 128 devices
-#define AUDIT           if(1)
 
 /* Uncomment the following line if you want just one session per I/O node at a time */
 // #define SINGLE_SESSION_OBJECT
@@ -287,8 +286,8 @@ static void deferred_write(struct work_struct *work)
         struct device_struct *dev;
 
         wr_info = to_packed_write(work);
-        AUDIT
-        printk("%s: kworker (%d) processes a low prio write on dev with [major,minor] number [%d,%d]\n",
+
+        pr_debug("%s: kworker (%d) processes a low prio write on dev with [major,minor] number [%d,%d]\n",
                MODNAME, current->pid, major, wr_info->minor);
 
         dev = devices + wr_info->minor;
@@ -359,7 +358,7 @@ static ssize_t actual_write(short prio, int minor, const char *buf, size_t count
  * 
  * Returns the number of characters read from the stream.
  */
-ssize_t actual_read(short prio, int minor, char *buf, size_t count)
+static ssize_t actual_read(short prio, int minor, char *buf, size_t count)
 {
         int ret;
         int amount;
@@ -422,8 +421,8 @@ static int mfd_open(struct inode *inode, struct file *file)
         /* set defaults values for new session */
         session->current_priority = LOW_PRIORITY;
         session->timeout = MAX_WAIT_TIMEINT;            // no timeout
-        AUDIT
-        printk("%s: device file successfully opened for object with [major,minor] number [%d,%d]\n",
+
+        pr_debug("%s: device file successfully opened for object with [major,minor] number [%d,%d]\n",
                MODNAME, get_major(file), get_minor(file));
         return 0;
 }
@@ -442,8 +441,8 @@ static int mfd_release(struct inode *inode, struct file *file)
         mutex_unlock(&(dev->busy));
 #endif
         kfree(file->private_data);
-        AUDIT
-        printk("%s: device file closed for object with dev with [major,minor] number [%d,%d]\n",
+
+        pr_debug("%s: device file closed for object with dev with [major,minor] number [%d,%d]\n",
                MODNAME, get_major(file), get_minor(file));
         return 0;
 }
@@ -453,7 +452,7 @@ static int mfd_release(struct inode *inode, struct file *file)
  * @file: I/O session to the device file
  * @buf: destination buffer
  * @count: the number of bytes you hope to read
- * @pos: unused
+ * @unused: unused parameter
  * 
  * Data delivery follows a First-in-First-out policy, so after the read 
  * operations, the read data disappears from the stream.
@@ -462,15 +461,14 @@ static int mfd_release(struct inode *inode, struct file *file)
  * 
  * Returns the number of characters read from the stream.
  */
-ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *pos)
+static ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *unused)
 {
         long ret;
         short idx;
         struct device_struct *dev = devices + get_minor(file);
         struct session_data *session = (struct session_data *)file->private_data;
 
-        AUDIT
-        printk("%s: somebody called a read on dev with [major,minor] number [%d,%d]\n",
+        pr_debug("%s: somebody called a read on dev with [major,minor] number [%d,%d]\n",
                MODNAME, get_major(file), get_minor(file));
 
         idx = session->current_priority;
@@ -509,7 +507,7 @@ ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *pos)
  * @file: I/O session to the device file
  * @buf: source buffer
  * @count: the number of bytes you hope to write
- * @pos: unused
+ * @unused: unused parameter
  * 
  * Data delivery follows a First-in-First-out policy, so the data is written
  * at the end of those already present.
@@ -520,7 +518,7 @@ ssize_t mfd_read(struct file *file, char *buf, size_t count, loff_t *pos)
  * 
  * Returns the number of characters written to the stream.
  */
-ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *pos)
+static ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *unused)
 {
         long ret;
         struct packed_write *container;
@@ -529,8 +527,7 @@ ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_t *pos)
         short idx = session->current_priority;
         gfp_t mask = GFP_KERNEL;
 
-        AUDIT
-        printk("%s: somebody called a write on dev with [major,minor] number [%d,%d]\n",
+        pr_debug("%s: somebody called a write on dev with [major,minor] number [%d,%d]\n",
                 MODNAME, get_major(file), get_minor(file));
 
         if (file->f_flags & O_NONBLOCK) {
@@ -615,8 +612,7 @@ static long mfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         struct session_data *session = file->private_data;
         long ret = 0;
 
-        AUDIT
-        printk("%s: somebody called a ioctl on dev with [major,minor] number [%d,%d] and command %d\n",
+        pr_debug("%s: somebody called a ioctl on dev with [major,minor] number [%d,%d] and command %d\n",
                MODNAME, get_major(file), get_minor(file), cmd);
 
         switch (cmd)
@@ -677,7 +673,7 @@ static struct file_operations fops = {
  * 
  * Returns 0 if initialization is successful, otherwise a negative value.
  */
-int multi_flow_dev_init(void)
+static int multi_flow_dev_init(void)
 {
         int i, j, k;
         char queue_name[WQ_NAME_LENGTH];
@@ -738,7 +734,7 @@ revert_allocation:
 /**
  * multi_flow_dev_cleanup - does the module cleanup
  */
-void multi_flow_dev_cleanup(void)
+static void multi_flow_dev_cleanup(void)
 {
         int i, k;
         for (i = 0; i < MINORS; i++) {

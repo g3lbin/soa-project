@@ -5,6 +5,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include "../mfdlib/ioctl.h"
 
 int i;
 char buff[4096];
@@ -46,7 +47,7 @@ void * the_thread(void *path){
 	system(command);
 
 	/* TEST IOCTL */
-	ret = ioctl(fd,0);
+	ret = ioctl(fd,IOC_SWITCH_PRIORITY);
 	if (ret != 1)
 		printf("impossible to change priority level for device '%s'\n", device);
 	else
@@ -64,7 +65,7 @@ void * the_thread(void *path){
 	system(command);
 
 	/* TEST IOCTL */
-	ret = ioctl(fd,0);
+	ret = ioctl(fd,IOC_SWITCH_PRIORITY);
 	if (ret != 0)
 		printf("impossible to change priority level for device '%s'\n", device);
 	else
@@ -103,6 +104,7 @@ int main(int argc, char** argv)
 		sprintf(buff,"mknod %s%d c %d %i\n", path, i, major, i);
 		system(buff);
 		sprintf(buff, "%s%d", path, i);
+		// sprintf(buff, "%s3", path);
 		pthread_create(&tid, NULL, the_thread, strdup(buff));
     }
 

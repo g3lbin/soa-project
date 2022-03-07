@@ -161,7 +161,7 @@ int main(int argc, char** argv)
 	major = strtol(argv[2],NULL,10);
 	minor = strtol(argv[3],NULL,10);
 
-    sprintf(buff,"mknod %s%d c %d %d\n", path, minor, major, minor);
+    sprintf(buff,"mknod %s%d c %d %d 2>/dev/null\n", path, minor, major, minor);
     system(buff);
     sprintf(buff, "%s%d", path, minor);
     pthread_create(&tid, NULL, the_thread, strdup(buff));

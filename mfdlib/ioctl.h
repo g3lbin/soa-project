@@ -9,8 +9,8 @@
  * the predefined command FIONBIO, but the IOC_SWITCH_BLOCKING is useful
  * for printk prints and makes the driver complete and independent.
  */
-#ifndef _MFD_IOCTL
-#define _MFD_IOCTL
+#ifndef _MFD_IOCTL_H
+#define _MFD_IOCTL_H
 
 #define IOC_MAGIC 'r'
 #define IOC_SWITCH_PRIORITY     _IO(IOC_MAGIC, 0x20)            // switch the priority level (high or low) for the operations
