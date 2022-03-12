@@ -1,5 +1,6 @@
-/*
- * ioctl.h defines the command codes used to make IOCTL requests
+/**
+ * @file ioctl.h
+ * @brief Defines the command codes used to make IOCTL requests.
  *
  * The IOCTL magic number and the command numbers were chosen according
  * to the following link:
@@ -8,7 +9,12 @@
  * Note: to modify the O_NONBLOCK flag in filp->f_flags can also be used
  * the predefined command FIONBIO, but the IOC_SWITCH_BLOCKING is useful
  * for printk prints and makes the driver complete and independent.
+ * 
+ * @author Cristiano Cuffaro
+ * 
+ * @date March 12, 2022
  */
+
 #ifndef _MFD_IOCTL_H
 #define _MFD_IOCTL_H
 

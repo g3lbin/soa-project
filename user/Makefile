@@ -1,2 +1,4 @@
-all:
-	gcc user.c -lpthread -o user
+controller:
+	gcc device-controller.c -lpthread -o device-controller
+multithread:
+	gcc simple-multithread.c -lpthread -o simple-multithread

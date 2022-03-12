@@ -6,7 +6,7 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 
-#include "../mfdlib/ioctl.h"
+#include "../include/ioctl.h"
 
 char buff[4096];
 
@@ -27,7 +27,6 @@ void *the_thread(void *path)
 	int ret;
     int num;
     int ch;
-    long jiffies;
     long timeout;
 	char command[256];
     char bytes[4100];
@@ -38,7 +37,7 @@ void *the_thread(void *path)
     int_to_priority(prio_str, priority);
 
     while(1) {
-        system("clear\n");
+        printf("\033[2J\033[H");
 		printf("*** Main menu ***\n\n");
         printf("1) Open device\n");
         printf("2) Close device\n");
@@ -123,11 +122,11 @@ void *the_thread(void *path)
             scanf("%ld", &timeout);
             while (getchar() != '\n');
 
-            jiffies = ioctl(fd, IOC_SET_WAIT_TIMEINT, &timeout);
-            if (jiffies < 0)
-                printf("(%ld) impossible to set wait timeout interval for device '%s'\n", jiffies, device);
+            ret = ioctl(fd, IOC_SET_WAIT_TIMEINT, &timeout);
+            if (ret < 0)
+                printf("(%d) impossible to set wait timeout interval for device '%s'\n", ret, device);
             else
-                printf("now the maximum wait for blocking operations is %ld jiffies\n", jiffies);
+                printf("now the maximum wait for blocking operations is '%ld' secs\n", timeout);
             break;
         default:
             system("clear\n");
