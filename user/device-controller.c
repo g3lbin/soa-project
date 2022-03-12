@@ -29,7 +29,7 @@ void *the_thread(void *path)
     int ch;
     long timeout;
 	char command[256];
-    char bytes[4100];
+    char bytes[4096];
     char prio_str[8];
     int priority = 0;
 
@@ -58,29 +58,36 @@ void *the_thread(void *path)
         switch (op)
         {
         case 1:
-            printf("opening device %s\n", device);
             fd = open(device, O_RDWR);
             if(fd < 0) {
-                printf("(%d) open error on device %s\n", fd, device);
+                printf("(%d) open error on device '%s'\n", fd, device);
             } else {
-                printf("device %s successfully opened with the following characteristics:\n", device);
+                printf("device '%s' opened with the following characteristics:\n", device);
                 printf("- you are working on %s priority data stream\n", prio_str);
                 printf("- you are working with blocking read and write operations\n");
-                printf("- timeout for blocking operations is set to infinite value\n\n");
+                printf("- timeout for blocking operations is set to '10' secs\n\n");
             }
             break;
         case 2:
-            printf("device %s successfully closed\n\n", device);
-            close(fd);
+            ret = close(fd);
+            if(ret < 0) {
+                printf("(%d) close error on device '%s'\n", ret, device);
+            } else {
+                printf("device '%s' successfully closed\n\n", device);
+            }
             fd = -1;
             break;
         case 3:
-            printf("insert the bytes which should be written on %s priority data stream:\n",
+            printf("enter up to 4095 bytes which should be written on %s priority data stream:\n",
                     prio_str);
             num = 0;
-            while ((ch = getchar()) != '\n' && ch != EOF) {
+            while ((ch = getchar()) != '\n' && ch != EOF && num < 4096) {
                 bytes[num++] = ch;
             }
+            if (ch != '\n' && ch != EOF)
+                do {
+                    ch = getchar();
+                } while (ch != '\n' || ch != EOF);
             bytes[num] = '\0';
             ret = write(fd, bytes, num);
             if (ret < 0)
@@ -90,10 +97,12 @@ void *the_thread(void *path)
                         ret, prio_str, device);
             break;
         case 4:
-            printf("insert the number of bytes which should be read from %s priority data stream:\n",
+            printf("enter the number (up to 4095) of bytes which should be read from %s priority data stream:\n",
                     prio_str);
             scanf("%d", &num);
             while (getchar() != '\n');
+            if (num > 4095)
+                num = 4095;
             ret = read(fd, bytes, num);
             if (ret < 0)
                 printf("(%d) read on device '%s' failed\n\n", ret, device);
@@ -118,7 +127,7 @@ void *the_thread(void *path)
                 printf("now you are working with %s read and write operations\n", (ret ? "non-blocking" : "blocking"));
             break;
         case 7:
-            printf("insert the new timeout interval value (in seconds):\n");
+            printf("enter the new timeout interval value (in seconds):\n");
             scanf("%ld", &timeout);
             while (getchar() != '\n');
 
@@ -130,7 +139,7 @@ void *the_thread(void *path)
             break;
         default:
             system("clear\n");
-		    printf("uscita...\n\n");
+		    printf("Press 'ctrl + c' to exit. Bye!\n\n");
             goto end;
         }
         getchar();
@@ -162,7 +171,7 @@ int main(int argc, char** argv)
 
     sprintf(buff,"mknod %s%d c %d %d 2>/dev/null\n", path, minor, major, minor);
     system(buff);
-    sprintf(buff, "%s%d", path, minor);
+    snprintf(buff, 4096, "%s%d", path, minor);
     pthread_create(&tid, NULL, the_thread, strdup(buff));
 
 
