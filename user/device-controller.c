@@ -8,8 +8,6 @@
 
 #include "../include/ioctl.h"
 
-char buff[4096];
-
 void int_to_priority(char *buf, int prio)
 {
     memset(buf, 0x0, sizeof(buf));
@@ -60,7 +58,7 @@ void *the_thread(void *path)
         case 1:
             fd = open(device, O_RDWR);
             if(fd < 0) {
-                printf("(%d) open error on device '%s'\n", fd, device);
+                perror("open error");
             } else {
                 printf("device '%s' opened with the following characteristics:\n", device);
                 printf("- you are working on %s priority data stream\n", prio_str);
@@ -71,7 +69,7 @@ void *the_thread(void *path)
         case 2:
             ret = close(fd);
             if(ret < 0) {
-                printf("(%d) close error on device '%s'\n", ret, device);
+                perror("close error");
             } else {
                 printf("device '%s' successfully closed\n\n", device);
             }
@@ -91,7 +89,7 @@ void *the_thread(void *path)
             bytes[num] = '\0';
             ret = write(fd, bytes, num);
             if (ret < 0)
-                printf("(%d) write on device '%s' failed\n\n", ret, device);
+                perror("write error");
             else
                 printf("writed %d bytes on %s priority data stream of device %s\n\n",
                         ret, prio_str, device);
@@ -105,26 +103,28 @@ void *the_thread(void *path)
                 num = 4095;
             ret = read(fd, bytes, num);
             if (ret < 0)
-                printf("(%d) read on device '%s' failed\n\n", ret, device);
+                perror("read error");
             else
                 printf("read %d bytes:\n%s\n\n", ret, bytes);
             break;
         case 5:
             ret = ioctl(fd, IOC_SWITCH_PRIORITY);
             if (ret < 0) {
-                printf("(%d) impossible to change priority level for device '%s'\n", ret, device);
+                perror("ioctl error - impossible to change priority level");
             } else {
                 priority = ret;
                 int_to_priority(prio_str, ret);
-                printf("now you are working on %s priority data stream\n", prio_str);
+                printf("now you are working on %s priority data stream\n",
+                       prio_str);
             }
             break;
         case 6:
             ret = ioctl(fd, IOC_SWITCH_BLOCKING);
             if (ret < 0)
-                printf("(%d) impossible to switch blocking operations mode for device '%s'\n", ret, device);
+                perror("ioctl error - impossible to switch blocking operations mode");
             else
-                printf("now you are working with %s read and write operations\n", (ret ? "non-blocking" : "blocking"));
+                printf("now you are working with %s read and write operations\n",
+                       (ret ? "non-blocking" : "blocking"));
             break;
         case 7:
             printf("enter the new timeout interval value (in seconds):\n");
@@ -133,9 +133,10 @@ void *the_thread(void *path)
 
             ret = ioctl(fd, IOC_SET_WAIT_TIMEINT, &timeout);
             if (ret < 0)
-                printf("(%d) impossible to set wait timeout interval for device '%s'\n", ret, device);
+                perror("ioctl error - impossible to set wait timeout interval");
             else
-                printf("now the maximum wait for blocking operations is '%ld' secs\n", timeout);
+                printf("now the maximum wait for blocking operations is '%ld' secs\n",
+                       timeout);
             break;
         default:
             system("clear\n");
@@ -159,6 +160,7 @@ int main(int argc, char** argv)
 	int minor;
 	char *path;
 	pthread_t tid;
+    char buff[512];
 
 	if(argc < 4) {
 		printf("Usage: %s <pathname> <major> <minor>\n", *argv);
@@ -171,7 +173,7 @@ int main(int argc, char** argv)
 
     sprintf(buff,"mknod %s%d c %d %d 2>/dev/null\n", path, minor, major, minor);
     system(buff);
-    snprintf(buff, 4096, "%s%d", path, minor);
+    snprintf(buff, 512, "%s%d", path, minor);
     pthread_create(&tid, NULL, the_thread, strdup(buff));
 
 
