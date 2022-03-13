@@ -17,6 +17,7 @@ clean:
 	make -C $(KDIR) M=$(PWD) clean
 
 STATUS_ARRAY 	= /sys/module/multi_flow_dev/parameters/device_status
+DEV		= 0
 
 ch_dev_status	= 								\
 	@if ! [[ $(DEV) =~ ^[0-9]+$$ ]]; then					\
@@ -42,16 +43,10 @@ ch_dev_status	= 								\
 	fi
 
 disable:
-ifndef DEV
-$(error set DEV=<minor>)
-endif
 	$(eval STATUS := 0)
 	$(ch_dev_status)
 
 enable:
-ifndef DEV
-$(error set DEV=<minor>)
-endif
 	$(eval STATUS := 1)
 	$(ch_dev_status)
 	
