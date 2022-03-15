@@ -414,8 +414,8 @@ static ssize_t mfd_write(struct file *file, const char *buf, size_t count, loff_
 {
         long ret;
         bool nonblock;
-        struct data_segment *seg;
-        struct packed_write *container;
+        struct data_segment *seg = NULL;
+        struct packed_write *container = NULL;
         struct device_struct *dev = devices + get_minor(file);
         struct session_data *session = (struct session_data *)file->private_data;
         short idx = session->current_priority;

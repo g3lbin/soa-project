@@ -92,7 +92,7 @@ void *the_thread(void *path)
             while ((ch = getchar()) != '\n' && ch != EOF && num < 4096) {
                 bytes[num++] = ch;
             }
-            while (ch != '\n' || ch != EOF) {
+            while (ch != '\n' && ch != EOF) {
                 ch = getchar();
             }
             bytes[num] = '\0';
