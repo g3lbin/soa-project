@@ -21,10 +21,28 @@
  */
 
 #define EXPORT_SYMTAB
+#include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/version.h>
 #include <linux/slab.h>
+#include <linux/mutex.h>
+#include <linux/uaccess.h>
+#include <linux/string.h>
+#include <linux/wait.h>
+#include <linux/cdev.h>
+#include <linux/errno.h>
+#include <linux/device.h>
+#include <linux/kprobes.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
+#include <linux/interrupt.h>
+#include <linux/time.h>
+#include <asm/page.h>
+#include <asm/cacheflush.h>
+#include <asm/apic.h>
+#include <linux/syscalls.h>
 
 #include "include/mfd.h"
 #include "include/ioctl.h"
@@ -73,9 +91,9 @@ static int                      major;                  /* major number assigned
 static struct device_struct     devices[MINORS];        /* the multi-flow device objects */
 
 /* Module parameters */
-static int      device_status[MINORS];                          // can be enabled (1) or disabled (0)
-static char     bytes_present[MINORS][CHARP_ENTRY_SIZE];        // bytes present on the devices streams
-static char     waiting_for_data[MINORS][CHARP_ENTRY_SIZE];     // waiting threads on the devices streams
+static int      device_status[MINORS];                          /* can be enabled (1) or disabled (0) */
+static char     bytes_present[MINORS][CHARP_ENTRY_SIZE];        /* bytes present on the devices streams */
+static char     waiting_for_data[MINORS][CHARP_ENTRY_SIZE];     /* waiting threads on the devices streams */
 
 module_param_array(device_status, int, NULL, S_IRUGO | S_IWUSR);
 mfd_module_param_array_named(bytes_present_on_devices_streams,
@@ -187,7 +205,7 @@ static void deferred_write(struct work_struct *work)
         wake_up_interruptible(&(dev->waitq[LOW_PRIORITY]));
         mutex_unlock(&(dev->sync[LOW_PRIORITY]));
 
-        kfree((void *)wr_info);
+        free_packed_write(wr_info);
         module_put(THIS_MODULE);
         return;
 }
@@ -292,8 +310,8 @@ static int mfd_open(struct inode *inode, struct file *file)
         session->current_priority = LOW_PRIORITY;
         session->timeout = 10 * HZ;     // 10 seconds
 
-        pr_debug("%s: device file opened for object with [major,minor] number [%d,%d]\n",
-               MODNAME, get_major(file), get_minor(file));
+        pr_debug("%s: device file opened by thread '%d' for object with [major,minor] number [%d,%d]\n",
+               MODNAME, current->pid, get_major(file), get_minor(file));
         return 0;
 }
 
@@ -312,8 +330,8 @@ static int mfd_release(struct inode *inode, struct file *file)
 #endif
         kfree(file->private_data);
 
-        pr_debug("%s: device file closed for object with [major,minor] number [%d,%d]\n",
-               MODNAME, get_major(file), get_minor(file));
+        pr_debug("%s: device file closed by thread '%d' for object with [major,minor] number [%d,%d]\n",
+               MODNAME, current->pid, get_major(file), get_minor(file));
         return 0;
 }
 

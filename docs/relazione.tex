@@ -1,0 +1,84 @@
+\documentclass{article}
+\usepackage[a4paper]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[italian]{babel}
+\usepackage{geometry}
+\usepackage[font={small,sl}]{caption}
+\usepackage[section]{placeins}
+\usepackage{graphicx}
+\usepackage[table, dvipsnames]{xcolor}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage[font={small,sl}]{caption}
+\usepackage{hyperref}
+
+\def\code#1{\texttt{#1}}
+
+\setlength{\parskip}{1em}
+\setlength{\parindent}{0em}
+\setlength{\arrayrulewidth}{0.1em}
+
+\hypersetup{
+    colorlinks=true,
+    citecolor=blue,
+    linkcolor=blue,
+    linktocpage=true,
+    urlcolor=blue,
+    pdftitle={Relazione Progetto SOA},
+    pdfauthor={C. Cuffaro}
+}
+
+% Colori per i listing
+\definecolor{code_red}{rgb}{0.6,0,0} % strings
+\definecolor{code_green}{rgb}{0.25,0.5,0.35} % comments
+\definecolor{code_purple}{rgb}{0.5,0,0.35} % keywords
+\definecolor{code_background}{rgb}{0.95,0.95,0.92} % background
+
+% Stile del codice standard (C)
+\lstset{
+	language=C, 
+	backgroundcolor=\color{code_background},
+	frame=single,
+	basicstyle=\ttfamily\small,
+	keywordstyle=\color{code_purple}\bfseries\small,
+	stringstyle=\color{code_red}\small,
+	commentstyle=\color{code_green}\small,
+	numbers=left,
+	numberstyle=\small\color{gray},
+	numbersep=5pt,
+	tabsize=4,
+	showtabs=false,
+	showspaces=false,
+	showstringspaces=false,
+	escapechar=|, 
+	captionpos=b,
+	breaklines=true,
+}
+
+\renewcommand{\lstlistingname}{Snippet}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small C. Cuffaro}
+\rhead{\small Relazione Progetto SOA}
+\cfoot{\thepage}
+%\cfoot{Pagina \thepage}
+
+\begin{document}
+\author{%
+Cristiano Cuffaro \\
+{\small matricola: \texttt{0299838}} \\
+{\small \texttt{cristiano.cuffaro@outlook.com}}
+}
+\title{Relazione Progetto SOA}
+\date{A.A. 2021-2022}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\end{document}

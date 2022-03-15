@@ -1,3 +1,13 @@
+/**
+ * @file device-controller.c
+ * @brief This is a thin client that allows you to interact with the multi-flow
+ *        devices implemented by the multi-flow-dev module.
+ *
+ * @author Cristiano Cuffaro
+ * 
+ * @date March 12, 2022
+ */
+
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -82,10 +92,9 @@ void *the_thread(void *path)
             while ((ch = getchar()) != '\n' && ch != EOF && num < 4096) {
                 bytes[num++] = ch;
             }
-            if (ch != '\n' && ch != EOF)
-                do {
-                    ch = getchar();
-                } while (ch != '\n' || ch != EOF);
+            while (ch != '\n' || ch != EOF) {
+                ch = getchar();
+            }
             bytes[num] = '\0';
             ret = write(fd, bytes, num);
             if (ret < 0)
@@ -175,7 +184,6 @@ int main(int argc, char** argv)
     system(buff);
     snprintf(buff, 512, "%s%d", path, minor);
     pthread_create(&tid, NULL, the_thread, strdup(buff));
-
 
 	pause();
 	return 0;
