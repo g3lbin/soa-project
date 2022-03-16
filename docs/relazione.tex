@@ -129,6 +129,47 @@ Per mantenere il puntatore a questa struttura viene sfruttato il campo \texttt{.
 Per determinare se l'operazione di apertura è stata eseguita in modalità non bloccante, viene controllato se all'interno del campo \texttt{file->f\_flags} è settato il flag \texttt{O\_NONBLOCK}. In caso di operazioni non bloccanti, tutte le allocazioni di memoria vengono eseguite specificando la maschera \texttt{GFP\_ATOMIC}, grazie alla quale la chiamata verso l'allocatore di memoria può fallire senza portare il thread a dormire qualora non vi fosse memoria immediatamente disponibile.
 
 \subsection{Operazione di rilascio}
+La funzione \texttt{mfd\_release} è invocata quando viene rilasciata la struttura \texttt{file} e, in maniera duale rispetto alla \texttt{mfd\_open}, si occupa di riconsegnare all'allocatore l'area di memoria puntata da \texttt{file->private\_data}.
 
+\subsection{Operazione di lettura}
+La funzione \texttt{mfd\_read} viene invocata quando si esegue un'operazione di lettura su un multi-flow device file.
+
+Se per la sessione di I/O è settato il flag \texttt{O\_NONBLOCK}, viene fatto quanto segue:
+\begin{enumerate}
+\item si esegue una trylock sul mutex relativo allo stream di dati da cui si vuole leggere;
+\item si verifica se la quantità di dati leggibili è pari a zero;
+\end{enumerate}
+se fallisce l'acquisizione del mutex o non ci sono dati da leggere, la funzione restituisce \texttt{-EAGAIN}.
+
+Se l'operazione di lettura è eseguita in modalità bloccante, si procede come segue:
+\begin{enumerate}
+\item viene incrementato il numero di thread in attesa di dati provenienti dal data stream in questione;
+\item viene invocata l'API \texttt{wait\_event\_interruptible\_timeout} specificando:
+\begin{enumerate}
+\item la waitqueue corrispondente al data stream;
+\item la condizione che determina il risveglio dei thread;
+\item il timeout specificato nei dati di sessione;
+\end{enumerate}
+\item se il thread esce dal sonno per via del termine del timeout o per una segnalazione, la funzione restituisce l'errore corrispondente.
+\end{enumerate}
+Per far sì che ogni \textsl{wake up} porti al risveglio di al più un thread posto sulla waitqueue, invece di specificare direttamente alla wait event API la condizione che il numero di byte leggibili sia maggiore di zero, viene specificata la macro \texttt{lock\_and\_check}, mostrata nello snippet \ref{lst-1}.
+\begin{lstlisting}[label=lst-1, caption={Macro \texttt{lock\_and\_check}}]
+#define lock_and_check(condition, mutexp)       \
+({                                              \
+        int __ret = 0;                          \
+        if (mutex_trylock(mutexp)) {            \
+                if (condition)                  \
+                        __ret = 1;              \
+                else                            \
+                        mutex_unlock(mutexp);   \
+        }                                       \
+        __ret;                                  \
+})
+\end{lstlisting}
+Grazie ad essa, è possibile provare ad acquisire il lock prima di controllare la condizione reale su cui eventualmente dormire; per cui un solo thread ha la possibilità di risvegliarsi avendo già acquisito il lock, se la condizione è soddisfatta. In tutti gli altri casi si rimane in sleep.
+
+Una volta usciti dalla wait event API, si decrementa il numero di thread in attesa e si prosegue con la lettura effettiva dei dati.
+
+Sia nel caso di operazione bloccante che non, la lettura effettiva è realizzata invocando la funzione \texttt{actual\_read} ...
 
 \end{document}
