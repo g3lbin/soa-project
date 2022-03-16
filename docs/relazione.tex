@@ -81,4 +81,54 @@ Cristiano Cuffaro \\
 \tableofcontents
 \newpage
 
+\section{Rappresentazione dei device file}
+In accordo alla specifica del progetto e ai casi d'uso che si possono derivare da essa, è stata scelta una rappresentazione in RAM per i \textsl{multi-flow device file}.
+
+In particolare, uno stream di dati è implementato come una \textsl{linked list} di segmenti di dati dinamicamente allocati e agganciati tra una \textsl{head} ed una \textsl{tail} fittizie, come mostrato nella rappresentazione in figura \ref{fig-1}.
+
+\captionsetup[figure]{justification=centering}
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.8\textwidth]{img/segment-list}
+\caption{Lista di segmenti che implementa un data stream}
+\label{fig-1}
+\end{figure}
+
+Per ciascun segmento di dati, all'interno di una struttura \texttt{data\_segment} sono mantenute le seguenti informazioni:
+\begin{itemize}
+\item un puntatore ai dati effettivi;
+\item la dimensione corrente dei dati;
+\item un indice che rappresenta la posizione corrente di lettura;
+\item una struttura \texttt{list\_head} per il collegamento alla lista.
+\end{itemize}
+Quando è necessario allocare un nuovo segmento di dati, avviene un'unica chiamata verso lo \textsl{SLAB allocator} per ottenere un'area di memoria in cui impaccare la struttura dati nella parte alta e i dati effettivi in quella bassa. Inoltre, per limitare la dimensione reale della struttura a 40 byte è stata definita specificando l'attributo \texttt{packed}.
+
+In una struttura \texttt{device\_struct} sono definite le informazioni associate a ciascun device, in particolare:
+\begin{itemize}
+\item una waitqueue per ciascun data stream, ove si tiene traccia dei thread in attesa di prelevare o scaricare dati nel caso di letture o scritture bloccanti;
+\item una workqueue per mantenere il lavoro da eseguire in maniera \textsl{delayed} nel caso di scritture a bassa priorità;
+\item un mutex per ciascun data stream, necessario per sincronizzare le operazioni di lettura e scrittura;
+\item una struttura \texttt{segment\_list} per ciascun data stream, contenente gli elementi fittizi della lista;
+\item il numero di byte validi in ciascun data stream, ovvero quelli effettivamente leggibili;
+\item il numero di byte liberi in ciascun data stream, ovvero quelli che determinano la possibilità di eseguire delle operazioni di scrittura;
+\item il numero di thread in attesa di dati per ciascun data stream, ovvero la cardinalità dell'insieme dei lettori all'interno della corrispondente waitqueue.
+\end{itemize}
+Per aumentare il livello di sicurezza del VFS, per questa struttura dati è stata utilizzata la dicitura \texttt{\_\_randomize\_layout}, in modo tale che un eventuale attacco finalizzato a prelevare informazioni da un device file sia ostacolato dal fatto che lo spiazzamento a cui sono presenti i dati è arbitrario e cambia tra i vari kernel.
+
+\section{Operazioni sui multi-flow device file}
+Nelle seguenti sottosezioni sono descritte le funzioni che costituiscono il driver, ovvero che permettono di eseguire le varie operazioni sui device file che esso gestisce.
+
+\subsection{Operazione di apertura}
+La funzione \texttt{mfd\_open} consente l'apertura di un multi-flow device file. Ad ogni invocazione, la funzione verifica che il minor number associato al dispositivo sia gestibile dal driver e che esso non sia correntemente disabilitato. Se i controlli vanno a buon fine, viene allocata la memoria per ospitare una struttura \texttt{session\_data} contenente le seguenti informazioni:
+\begin{itemize}
+\item il livello di priorità dello stream di dati su cui si sta correntemente lavorando (bassa priorità per default);
+\item l'intervallo di tempo che determina la massima attesa per le operazioni di lettura e scrittura bloccanti (10 secondi per default).
+\end{itemize}
+Per mantenere il puntatore a questa struttura viene sfruttato il campo \texttt{.private\_data} della struttura \texttt{file} corrispondente alla sessione di I/O.
+
+Per determinare se l'operazione di apertura è stata eseguita in modalità non bloccante, viene controllato se all'interno del campo \texttt{file->f\_flags} è settato il flag \texttt{O\_NONBLOCK}. In caso di operazioni non bloccanti, tutte le allocazioni di memoria vengono eseguite specificando la maschera \texttt{GFP\_ATOMIC}, grazie alla quale la chiamata verso l'allocatore di memoria può fallire senza portare il thread a dormire qualora non vi fosse memoria immediatamente disponibile.
+
+\subsection{Operazione di rilascio}
+
+
 \end{document}
