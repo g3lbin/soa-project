@@ -115,11 +115,13 @@ In una struttura \texttt{device\_struct} sono definite le informazioni associate
 \end{itemize}
 Per aumentare il livello di sicurezza del VFS, per questa struttura dati è stata utilizzata la dicitura \texttt{\_\_randomize\_layout}, in modo tale che un eventuale attacco finalizzato a prelevare informazioni da un device file sia ostacolato dal fatto che lo spiazzamento a cui sono presenti i dati è arbitrario e cambia tra i vari kernel.
 
+Nella funzione di inizializzazione del modulo non vengono create workqueue standard, bensì \textsl{singlethread workqueue}. Questo fa sì che il deferred work sia processato lungo un unico \textsl{kworker deamon}, che riporta le operazioni di scrittura sul data stream di bassa priorità nello stesso ordine con cui sono state schedulate, senza necessità di meccanismi di ordinamento o sincronizzazione ulteriori.
+
 \section{Operazioni sui multi-flow device file}
 Nelle seguenti sottosezioni sono descritte le funzioni che costituiscono il driver, ovvero che permettono di eseguire le varie operazioni sui device file che esso gestisce.
 
 \subsection{Operazione di apertura}
-La funzione \texttt{mfd\_open} consente l'apertura di un multi-flow device file. Ad ogni invocazione, la funzione verifica che il minor number associato al dispositivo sia gestibile dal driver e che esso non sia correntemente disabilitato. Se i controlli vanno a buon fine, viene allocata la memoria per ospitare una struttura \texttt{session\_data} contenente le seguenti informazioni:
+La funzione \texttt{mfd\_open} consente l'apertura di un multi-flow device file. Ad ogni invocazione, essa verifica che il minor number associato al dispositivo sia gestibile dal driver e che esso non sia correntemente disabilitato. Se i controlli vanno a buon fine, viene allocata la memoria per ospitare una struttura \texttt{session\_data} contenente le seguenti informazioni:
 \begin{itemize}
 \item il livello di priorità dello stream di dati su cui si sta correntemente lavorando (bassa priorità per default);
 \item l'intervallo di tempo che determina la massima attesa per le operazioni di lettura e scrittura bloccanti (10 secondi per default).
@@ -148,11 +150,11 @@ Se l'operazione di lettura è eseguita in modalità bloccante, si procede come s
 \begin{enumerate}
 \item la waitqueue corrispondente al data stream;
 \item la condizione che determina il risveglio dei thread;
-\item il timeout specificato nei dati di sessione;
+\item il timeout presente tra i dati di sessione;
 \end{enumerate}
 \item se il thread esce dal sonno per via del termine del timeout o per una segnalazione, la funzione restituisce l'errore corrispondente.
 \end{enumerate}
-Per far sì che ogni \textsl{wake up} porti al risveglio di al più un thread posto sulla waitqueue, invece di specificare direttamente alla wait event API la condizione che il numero di byte leggibili sia maggiore di zero, viene specificata la macro \texttt{lock\_and\_check}, mostrata nello snippet \ref{lst-1}.
+Per far sì che ogni \textsl{wake up} porti al risveglio di al più un thread posto sulla waitqueue, invece di specificare direttamente alla wait queue API la condizione che il numero di byte leggibili sia maggiore di zero, viene specificata la macro \texttt{lock\_and\_check}, mostrata nello snippet \ref{lst-1}.
 \begin{lstlisting}[label=lst-1, caption={Macro \texttt{lock\_and\_check}}]
 #define lock_and_check(condition, mutexp)       \
 ({                                              \
@@ -166,10 +168,34 @@ Per far sì che ogni \textsl{wake up} porti al risveglio di al più un thread po
         __ret;                                  \
 })
 \end{lstlisting}
-Grazie ad essa, è possibile provare ad acquisire il lock prima di controllare la condizione reale su cui eventualmente dormire; per cui un solo thread ha la possibilità di risvegliarsi avendo già acquisito il lock, se la condizione è soddisfatta. In tutti gli altri casi si rimane in sleep.
+Grazie ad essa, è possibile provare ad acquisire il lock prima di controllare la condizione reale su cui eventualmente dormire; per cui un solo thread ha la possibilità di risvegliarsi avendo già acquisito il lock, se la condizione è soddisfatta. In tutti gli altri casi il valore della macro sarà zero e i thread torneranno a dormire.
 
-Una volta usciti dalla wait event API, si decrementa il numero di thread in attesa e si prosegue con la lettura effettiva dei dati.
+Una volta usciti dalla \texttt{wait\_event\_interruptible\_timeout}, si decrementa il numero di thread in attesa e si prosegue con la lettura effettiva dei dati.
 
-Sia nel caso di operazione bloccante che non, la lettura effettiva è realizzata invocando la funzione \texttt{actual\_read} ...
+Sia nel caso di operazione bloccante che non, una volta acquisito il lock la lettura effettiva è realizzata invocando la funzione \texttt{actual\_read} in cui si cerca di copiare tutto (o in parte) l'ammontare di byte indicato dall'utente all'interno del buffer specificato. Per farlo, dovendo rispettare una politica di consegna FIFO, vengono letti i segmenti di dati a partire dalla testa della lista, facendone avanzare l'indice di lettura ed eventualmente rimuovendoli non appena vuotati. Questa operazione altera sia il numero di byte validi per il data stream (riducendolo), che quello di byte liberi (incrementandolo).
+
+Al termine dell'operazione di lettura (o a valle di un errore riscontrato in sezione critica) viene eseguita l'API \texttt{wake\_up\_interruptible} per segnalare ad eventuali thread dormienti di verificare la condizione per la quale sono in attesa e infine viene restituito il numero di byte consegnati nel buffer utente (o l'opportuno codice d'errore).
+
+\subsection{Operazione di scrittura}
+La funzione \texttt{mfd\_write} viene invocata quando si esegue un'operazione di scrittura su un multi-flow device file.
+
+Prima di entrare in sezione critica, viene allocata la memoria per il nuovo segmento di dati che dovrà essere collegato alla lista corrispondente al data stream su cui si sta lavorando; ciò consentirà di acquisire e rilasciare il lock nel minor tempo possibile. Sia nel caso di operazione bloccante che non, per entrare in sezione critica viene svolto lo stesso lavoro analizzato per l'operazione di lettura, con la differenza che la condizione che consente di eseguire la scrittura è che il numero di byte liberi sia maggiore di zero. Per osservare un blocco in scrittura, è necessario che la dimensione dello stream di dati raggiunga il valore \texttt{MAX\_STRAM\_SIZE}, che per default è stato definito pari a \texttt{4*PAGE\_SIZE}.
+
+Una volta acquisito il lock, se l'operazione di scrittura ha come target il data stream ad alta priorità, deve essere eseguita in maniera sincrona e quindi viene invocata la funzione \texttt{actual\_write} che collega il segmento di dati in coda alla lista. In questo caso, anche questa operazione altera sia il numero di byte validi per il data stream (incrementandolo), che quello di byte liberi (riducendolo).
+
+Se l'operazione è invece a bassa priorità deve essere eseguita in maniera asincrona e quindi è necessario programmarne l'esecuzione. A tale scopo, prima di acquisire il lock viene allocata memoria anche per una struttura \texttt{packed\_write} che embedda quella da inserire nella workqueue, contenente le seguenti informazioni:
+\begin{itemize}
+\item la \texttt{work\_struct} effettiva;
+\item il minor number del device su cui andare a scrivere;
+\item il puntatore al segmento di dati da agganciare;
+\item il function pointer che porta al blocco di codice che esegue la reale operazione.
+\end{itemize}
+Per cui, la scrittura a bassa priorità si riduce all'invocazione di \texttt{schedule\_deferred\_work}, in cui:
+\begin{enumerate}
+\item viene eseguita una invocazione a \texttt{try\_module\_get} per incrementare lo \texttt{usage counter} del modulo ed evitare che possa essere smontato mentre c'è ancora del lavoro da svolgere nonostante non vi siano più sessioni verso i multi-flow device file;
+\item viene inizializzata la \texttt{work\_struct} indicando la \texttt{deferred\_write} come funzione che il kworker deamon dorvà eseguire e passando l'indirizzo della struttura stessa come dato;
+\item viene messo in coda il lavoro.
+\end{enumerate}
+Fatto ciò, viene decrementato solamente il numero di byte liberi, in modo tale che le altre operazioni di lettura e scrittura non siano compromesse dal fatto che un segmento di dati verrà agganciato in un istante successivo alla sua schedulazione.
 
 \end{document}
