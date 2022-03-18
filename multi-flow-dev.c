@@ -196,7 +196,7 @@ static void deferred_write(struct work_struct *work)
         wr_info = to_packed_write(work);
 
         pr_debug("%s: kworker '%d' writes on device with [major,minor] number [%d,%d]\n",
-               MODNAME, current->pid, major, wr_info->minor);
+                 MODNAME, current->pid, major, wr_info->minor);
 
         dev = devices + wr_info->minor;
 
@@ -311,7 +311,7 @@ static int mfd_open(struct inode *inode, struct file *file)
         session->timeout = 10 * HZ;     // 10 seconds
 
         pr_debug("%s: device file opened by thread '%d' for object with [major,minor] number [%d,%d]\n",
-               MODNAME, current->pid, get_major(file), get_minor(file));
+                 MODNAME, current->pid, get_major(file), get_minor(file));
         return 0;
 }
 
@@ -331,7 +331,7 @@ static int mfd_release(struct inode *inode, struct file *file)
         kfree(file->private_data);
 
         pr_debug("%s: device file closed by thread '%d' for object with [major,minor] number [%d,%d]\n",
-               MODNAME, current->pid, get_major(file), get_minor(file));
+                 MODNAME, current->pid, get_major(file), get_minor(file));
         return 0;
 }
 
@@ -530,7 +530,7 @@ static long mfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         long ret = 0;
 
         pr_debug("%s: thread '%d' called an ioctl on device with [major,minor] number [%d,%d] and command '%d'\n",
-               MODNAME, current->pid, get_major(file), get_minor(file), cmd);
+                 MODNAME, current->pid, get_major(file), get_minor(file), cmd);
 
         switch (cmd)
         {

@@ -174,12 +174,12 @@ Una volta usciti dalla \texttt{wait\_event\_interruptible\_timeout}, si decremen
 
 Sia nel caso di operazione bloccante che non, una volta acquisito il lock la lettura effettiva è realizzata invocando la funzione \texttt{actual\_read} in cui si cerca di copiare tutto (o in parte) l'ammontare di byte indicato dall'utente all'interno del buffer specificato. Per farlo, dovendo rispettare una politica di consegna FIFO, vengono letti i segmenti di dati a partire dalla testa della lista, facendone avanzare l'indice di lettura ed eventualmente rimuovendoli non appena vuotati. Questa operazione altera sia il numero di byte validi per il data stream (riducendolo), che quello di byte liberi (incrementandolo).
 
-Al termine dell'operazione di lettura (o a valle di un errore riscontrato in sezione critica) viene eseguita l'API \texttt{wake\_up\_interruptible} per segnalare ad eventuali thread dormienti di verificare la condizione per la quale sono in attesa e infine viene restituito il numero di byte consegnati nel buffer utente (o l'opportuno codice d'errore).
+Al termine dell'operazione di lettura (o a valle di un errore riscontrato eseguendo la sezione critica) viene eseguita l'API \texttt{wake\_up\_interruptible} per segnalare ad eventuali thread dormienti di verificare la condizione per la quale sono in attesa e infine viene restituito il numero di byte consegnati nel buffer utente (o l'opportuno codice d'errore).
 
 \subsection{Operazione di scrittura}
 La funzione \texttt{mfd\_write} viene invocata quando si esegue un'operazione di scrittura su un multi-flow device file.
 
-Prima di entrare in sezione critica, viene allocata la memoria per il nuovo segmento di dati che dovrà essere collegato alla lista corrispondente al data stream su cui si sta lavorando; ciò consentirà di acquisire e rilasciare il lock nel minor tempo possibile. Sia nel caso di operazione bloccante che non, per entrare in sezione critica viene svolto lo stesso lavoro analizzato per l'operazione di lettura, con la differenza che la condizione che consente di eseguire la scrittura è che il numero di byte liberi sia maggiore di zero. Per osservare un blocco in scrittura, è necessario che la dimensione dello stream di dati raggiunga il valore \texttt{MAX\_STRAM\_SIZE}, che per default è stato definito pari a \texttt{4*PAGE\_SIZE}.
+Prima di acquisire il lock, viene allocata la memoria per il nuovo segmento di dati che dovrà essere collegato alla lista corrispondente al data stream su cui si sta lavorando; ciò consentirà di acquisire e rilasciare il lock nel minor tempo possibile. Sia nel caso di operazione bloccante che non, per poter eseguire la sezione critica viene svolto lo stesso lavoro analizzato per l'operazione di lettura, con la differenza che la condizione che consente di eseguire la scrittura è che il numero di byte liberi sia maggiore di zero. Per osservare un blocco in scrittura, è necessario che la dimensione dello stream di dati raggiunga il valore \texttt{MAX\_STRAM\_SIZE}, che per default è stato definito pari a \texttt{4*PAGE\_SIZE}.
 
 Una volta acquisito il lock, se l'operazione di scrittura ha come target il data stream ad alta priorità, deve essere eseguita in maniera sincrona e quindi viene invocata la funzione \texttt{actual\_write} che collega il segmento di dati in coda alla lista. In questo caso, anche questa operazione altera sia il numero di byte validi per il data stream (incrementandolo), che quello di byte liberi (riducendolo).
 
@@ -197,5 +197,113 @@ Per cui, la scrittura a bassa priorità si riduce all'invocazione di \texttt{sch
 \item viene messo in coda il lavoro.
 \end{enumerate}
 Fatto ciò, viene decrementato solamente il numero di byte liberi, in modo tale che le altre operazioni di lettura e scrittura non siano compromesse dal fatto che un segmento di dati verrà agganciato in un istante successivo alla sua schedulazione.
+
+A questo livello di priorità, la reale operazione di scrittura verrà invocata dal kworker deamon che eseguirà la funzione \texttt{deferred\_write}, in cui:
+\begin{enumerate}
+\item all'indirizzo della struttura \texttt{work\_struct}, passato come argomento, viene applicata la macro \texttt{to\_packed\_write} che semplicemente utilizza \texttt{container\_of} per ottenere l'indirizzo della struttura \texttt{packed\_write} contenente le informazioni necessarie alla funzione per operare;
+\item viene invocata la funzione \texttt{actual\_write} che collega il segmento di dati in coda alla lista e a questo punto incrementa anche il numero di byte validi per il data stream;
+\item viene eseguita l'API \texttt{wake\_up\_interruptible};
+\item viene rilasciata la memoria che ospitava la struttura dati \texttt{packed\_write};
+\item viene decrementato lo usage counter del modulo.
+\end{enumerate}
+
+Sia nel caso di operazione di scrittura sincrona che asincrona, il valore di ritorno di \texttt{mfd\_write} è dato dal numero di byte (eventualmente inferiore a quello specificato dall'utente) che sono stati prelevati dallo user space, indipendentemente da quando questi verranno resi realmente disponibili.
+
+\subsection{Operazione di I/O control}
+La funzione \texttt{mfd\_ioctl} viene invocata quando si esegue una richiesta di gestione di un multi-flow device file.
+
+Di seguito sono descritte le richieste di \textsl{I/O control} che vengono gestite.
+\begin{itemize}
+\item \texttt{IOC\_SWITCH\_PRIORITY}, permette di cambiare il livello di priorità (alto o basso) con cui verranno eseguite le successive operazioni di lettura e scrittura per la sessione corrente;
+\item \texttt{IOC\_SWITCH\_BLOCKING}, permette di cambiare il valore del flag \texttt{O\_NONBLOCK} e di conseguenza far sì che le successive operazioni di lettura e scrittura siano eseguite in modalità bloccante o non per la sessione corrente;
+\item \texttt{IOC\_SET\_WAIT\_TIMEINT}, permette di impostare il massimo intervallo di tempo di attesa, espresso in secondi, per le operazioni di lettura e scrittura bloccanti.
+\end{itemize}
+
+L'aggiunta di questa ioctl è stata fatta utilizzando le convenzionali \texttt{\_IO} macro, che sono basate su una lettera o un numero che identifica il driver per le quali vengono utilizzate. In questo caso, la scelta sul cosiddetto \textsl{IOCTL magic number} e sui numeri associati alle singole macro è stata fatta evitando collisioni con le informazioni presenti nella tabella reperibile al seguente link:
+\begin{center}
+\url{https://www.kernel.org/doc/Documentation/ioctl/ioctl-number.txt}
+\end{center}
+
+\section{Parametri del modulo}
+Per rappresentare lo stato di operatività dei multi-flow device file, è stata utilizzata una variabile globale \texttt{device\_status} definita come parametro mediante la macro \texttt{module\_param\_array}. In questo modo è possibile sfruttare lo pseudo-file presente in \texttt{/sys} per abilitare o disabilitare un multi-flow device file.
+
+Per offrire le altre informazioni richieste come parametri non è stato seguito lo stesso approccio e questo ha evitato di duplicare le informazioni già presenti nella struttura dati \texttt{device\_struct} all'interno di variabili globali. In particolare, per ottenere una soluzione alternativa è stato osservato che all'interno della macro \texttt{module\_param\_array\_named} sono utilizzate le seguenti variabili:
+\begin{itemize}
+\item \texttt{param\_array\_ops}, che è la struttura \texttt{kernel\_param\_ops} contenente i function pointer verso le operazioni di \texttt{get}, \texttt{set} e \texttt{free} da eseguire quando si interagisce con un parametro che consiste in un array;
+\item \texttt{param\_ops\_\#\#type}, che è anch'essa una struttura \texttt{kernel\_param\_ops} il cui indirizzo viene assegnato al campo \texttt{.ops} di una struttura \texttt{kparam\_array} per indicare il set di operazioni da eseguire su ciascuna entry di tipo \texttt{type} del parametro.
+\end{itemize}
+Poiché nel kernel Linux le funzioni registrate in \texttt{param\_array\_ops} non sono state esportate (e.g. \texttt{param\_array\_get}), non è stato possibile definire una sorta di \textsl{wrapper} che a seconda del parametro su cui si sta lavorando può assumere un comportamento differente da quello standard. Per cui, la soluzione adottata è stata quella di definire una nuova macro \texttt{mfd\_module\_param\_array\_named} nella quale si utilizzano:
+\begin{itemize}
+\item \texttt{mfd\_param\_array\_ops}, in cui è registrata la sola funzione \texttt{mfd\_param\_array\_get} che viene invocata quando si cerca di listare il contenuto dello pseudo-file corrispondente al parametro.
+
+Internamente, per ogni entry dell'array invoca la funzione registrata nel campo \texttt{ops->get} della struttura \texttt{kparam\_array}, passando come argomento l'indice della entry stessa e ciò permette di determinare il contenuto della corrispondente riga dello pseudo-file;
+
+\item \texttt{mfd\_param\_ops\_\#\#type}, dove nel caso specifico si ha che \texttt{\#\#type} corrisponde sempre a \texttt{charp} e anche qui è stata registrata la sola funzione \texttt{mfd\_param\_get\_charp}, che a seconda del nome del parametro:
+\begin{itemize}
+\item produce una rappresentazione in caratteri del numero di byte presenti su ciascun data stream;
+\item produce una rappresentazione in caratteri del numero di thread in attesa di dati da ciascun data stream;
+\item in altri casi si comporta per default come l'originale \texttt{param\_get\_charp}.
+\end{itemize}
+Come specificato nel bullet precedente, nel campo \texttt{arg} della struttura \texttt{kernel\_param} è possibile reperire l'indice della entry per cui questa funzione sta eseguendo e questo coincide con il minor number del dispositivo, per cui si possono leggere le informazioni richieste direttamente dalla corrispondente struttura dati.
+\end{itemize}
+
+\section{Struttura del progetto}
+Di seguito è riportata un'indicazione dei file sorgenti ed header presenti all'interno della root directory del progetto.
+\begin{itemize}
+\item \texttt{docs/}
+\begin{itemize}
+\item \texttt{relazione.pdf} è il documento corrente.
+\end{itemize}
+\item \texttt{include/}
+\begin{itemize}
+\item \texttt{mfd.h} è il file header in cui sono definite le macro, le strutture dati e le funzioni \textsl{inline} a supporto del modulo.
+\end{itemize}
+\item \texttt{Makefile}
+\item \texttt{multi-flowdev.c} è il file sorgente principale per il modulo del kernel Linux che è stato sviluppato.
+\item \texttt{README.md}
+\item \texttt{user/}
+\begin{itemize}
+\item \texttt{device-controller.c} è un \textsl{thin client} molto semplice che può essere utilizzato per testare il funzionamento del driver.
+\end{itemize}
+\end{itemize}
+
+\section{Regole di compilazione}
+Posizionandosi nella root directory del progetto è possibile eseguire una o più delle seguenti regole di compilazione:
+\begin{itemize}
+\item \texttt{make [all]}
+\begin{itemize}
+\item compila la versione di base del modulo
+\end{itemize}
+\item \texttt{make debug}
+\begin{itemize}
+\item compila la versione del modulo predisposta per eseguirne il debug, poiché definisce il flag \texttt{DEBUG} che attiva le stampe di livello kernel eseguite con l'API \texttt{pr\_debug}
+\end{itemize}
+\item \texttt{make single-session}
+\begin{itemize}
+\item compila la versione del modulo in cui per ciascun device è presente un ulteriore mutex che ne consente l'uso esclusivo ed è pensato per un profilo operazionale in cui c'è la necessità di scrivere, in maniera temporalmente discontinua, una sequenza di dati logicamente continua
+\end{itemize}
+\item \texttt{make clean}
+\begin{itemize}
+\item elimina i file generati dalla compilazione
+\end{itemize}
+\item \texttt{make disable DEV=<minor>}
+\begin{itemize}
+\item consente di disabilitare il multi-flow device file corrispondente al minor number specificato
+\end{itemize}
+\item \texttt{make enable DEV=<minor>}
+\begin{itemize}
+\item consente di abilitare il multi-flow device file corrispondente al minor number specificato
+\end{itemize}
+\end{itemize}
+
+Per generare il file eseguibile corrispondente al thin client è sufficiente:
+\begin{enumerate}
+\item posizionarsi all'interno della directory \texttt{user/}
+\item eseguire il comando \texttt{make}
+\end{enumerate}
+e per la sua esecuzione:
+\begin{center}
+\texttt{./device-controller <NodePath> <Major> <Minor>}
+\end{center}
 
 \end{document}
