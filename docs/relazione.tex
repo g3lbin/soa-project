@@ -81,7 +81,7 @@ Cristiano Cuffaro \\
 \tableofcontents
 \newpage
 
-\section{Rappresentazione dei device file}
+\section{Rappresentazione dei multi-flow device file}
 In accordo alla specifica del progetto e ai casi d'uso che si possono derivare da essa, è stata scelta una rappresentazione in RAM per i \textsl{multi-flow device file}.
 
 In particolare, uno stream di dati è implementato come una \textsl{linked list} di segmenti di dati dinamicamente allocati e agganciati tra una \textsl{head} ed una \textsl{tail} fittizie, come mostrato nella rappresentazione in figura \ref{fig-1}.
@@ -128,10 +128,12 @@ La funzione \texttt{mfd\_open} consente l'apertura di un multi-flow device file.
 \end{itemize}
 Per mantenere il puntatore a questa struttura viene sfruttato il campo \texttt{.private\_data} della struttura \texttt{file} corrispondente alla sessione di I/O.
 
-Per determinare se l'operazione di apertura è stata eseguita in modalità non bloccante, viene controllato se all'interno del campo \texttt{file->f\_flags} è settato il flag \texttt{O\_NONBLOCK}. In caso di operazioni non bloccanti, tutte le allocazioni di memoria vengono eseguite specificando la maschera \texttt{GFP\_ATOMIC}, grazie alla quale la chiamata verso l'allocatore di memoria può fallire senza portare il thread a dormire qualora non vi fosse memoria immediatamente disponibile.
+Per determinare se l'operazione di apertura è stata eseguita in modalità non bloccante\footnote{Per ciò riguarda l'implementazione di operazioni di I/O bloccanti e non bloccanti, si è fatto riferimento al libro di testo: \textit{"Linux Device Drivers, 2nd Edition, Chapter 5: Enhanced Char Driver Operations, Section 2: Blocking I/O"}, consultabile al link: \url{https://www.oreilly.com/library/view/linux-device-drivers/0596000081/ch05s02.html}}, viene controllato se all'interno del campo \texttt{file->f\_flags} è settato il flag \texttt{O\_NONBLOCK}.
+
+In caso di operazioni non bloccanti, tutte le allocazioni di memoria vengono eseguite specificando la maschera \texttt{GFP\_ATOMIC}, grazie alla quale la chiamata verso l'allocatore di memoria può fallire senza portare il thread a dormire qualora non vi fosse memoria immediatamente disponibile.
 
 \subsection{Operazione di rilascio}
-La funzione \texttt{mfd\_release} è invocata quando viene rilasciata la struttura \texttt{file} e, in maniera duale rispetto alla \texttt{mfd\_open}, si occupa di riconsegnare all'allocatore l'area di memoria puntata da \texttt{file->private\_data}.
+La funzione \texttt{mfd\_release} è invocata quando viene rilasciata la struttura \texttt{file} e, in maniera opposta rispetto alla \texttt{mfd\_open}, si occupa di riconsegnare all'allocatore l'area di memoria puntata da \texttt{file->private\_data}.
 
 \subsection{Operazione di lettura}
 La funzione \texttt{mfd\_read} viene invocata quando si esegue un'operazione di lettura su un multi-flow device file.
@@ -150,11 +152,13 @@ Se l'operazione di lettura è eseguita in modalità bloccante, si procede come s
 \begin{enumerate}
 \item la waitqueue corrispondente al data stream;
 \item la condizione che determina il risveglio dei thread;
-\item il timeout presente tra i dati di sessione;
+\item il timer interval presente tra i dati di sessione;
 \end{enumerate}
-\item se il thread esce dal sonno per via del termine del timeout o per una segnalazione, la funzione restituisce l'errore corrispondente.
+\item se il thread esce dal sonno a causa dello scadere del timeout o per una segnalazione, la funzione restituisce l'errore corrispondente.
 \end{enumerate}
 Per far sì che ogni \textsl{wake up} porti al risveglio di al più un thread posto sulla waitqueue, invece di specificare direttamente alla wait queue API la condizione che il numero di byte leggibili sia maggiore di zero, viene specificata la macro \texttt{lock\_and\_check}, mostrata nello snippet \ref{lst-1}.
+
+\newpage
 \begin{lstlisting}[label=lst-1, caption={Macro \texttt{lock\_and\_check}}]
 #define lock_and_check(condition, mutexp)       \
 ({                                              \
@@ -179,11 +183,13 @@ Al termine dell'operazione di lettura (o a valle di un errore riscontrato esegue
 \subsection{Operazione di scrittura}
 La funzione \texttt{mfd\_write} viene invocata quando si esegue un'operazione di scrittura su un multi-flow device file.
 
-Prima di acquisire il lock, viene allocata la memoria per il nuovo segmento di dati che dovrà essere collegato alla lista corrispondente al data stream su cui si sta lavorando; ciò consentirà di acquisire e rilasciare il lock nel minor tempo possibile. Sia nel caso di operazione bloccante che non, per poter eseguire la sezione critica viene svolto lo stesso lavoro analizzato per l'operazione di lettura, con la differenza che la condizione che consente di eseguire la scrittura è che il numero di byte liberi sia maggiore di zero. Per osservare un blocco in scrittura, è necessario che la dimensione dello stream di dati raggiunga il valore \texttt{MAX\_STRAM\_SIZE}, che per default è stato definito pari a \texttt{4*PAGE\_SIZE}.
+Prima di acquisire il lock, viene allocata la memoria per il nuovo segmento di dati che dovrà essere collegato alla lista corrispondente al data stream su cui si sta lavorando; ciò consentirà di acquisire e rilasciare il lock nel minor tempo possibile. Sia nel caso di operazione bloccante che non, per poter eseguire la sezione critica viene svolto lo stesso lavoro analizzato per l'operazione di lettura, con la differenza che la condizione che consente di eseguire la scrittura è che il numero di byte liberi sia maggiore di zero.
+
+Per osservare un blocco in scrittura, è necessario che la dimensione dello stream di dati raggiunga il valore \texttt{MAX\_STRAM\_SIZE}, che per default è stato definito pari a \texttt{4*PAGE\_SIZE}.
 
 Una volta acquisito il lock, se l'operazione di scrittura ha come target il data stream ad alta priorità, deve essere eseguita in maniera sincrona e quindi viene invocata la funzione \texttt{actual\_write} che collega il segmento di dati in coda alla lista. In questo caso, anche questa operazione altera sia il numero di byte validi per il data stream (incrementandolo), che quello di byte liberi (riducendolo).
 
-Se l'operazione è invece a bassa priorità deve essere eseguita in maniera asincrona e quindi è necessario programmarne l'esecuzione. A tale scopo, prima di acquisire il lock viene allocata memoria anche per una struttura \texttt{packed\_write} che embedda quella da inserire nella workqueue, contenente le seguenti informazioni:
+Se l'operazione è invece a bassa priorità deve essere eseguita in maniera asincrona e quindi è necessario programmarne l'esecuzione. A tale scopo, prima di acquisire il lock viene allocata memoria anche per una struttura \texttt{packed\_write} che incapsula quella da inserire nella workqueue, contenente le seguenti informazioni:
 \begin{itemize}
 \item la \texttt{work\_struct} effettiva;
 \item il minor number del device su cui andare a scrivere;
@@ -219,7 +225,7 @@ Di seguito sono descritte le richieste di \textsl{I/O control} che vengono gesti
 \item \texttt{IOC\_SET\_WAIT\_TIMEINT}, permette di impostare il massimo intervallo di tempo di attesa, espresso in secondi, per le operazioni di lettura e scrittura bloccanti.
 \end{itemize}
 
-L'aggiunta di questa ioctl è stata fatta utilizzando le convenzionali \texttt{\_IO} macro, che sono basate su una lettera o un numero che identifica il driver per le quali vengono utilizzate. In questo caso, la scelta sul cosiddetto \textsl{IOCTL magic number} e sui numeri associati alle singole macro è stata fatta evitando collisioni con le informazioni presenti nella tabella reperibile al seguente link:
+L'aggiunta di questa ioctl è stata fatta utilizzando le convenzionali \texttt{\_IO} macro, che sono basate su una lettera o un numero che identifica il driver per le quali vengono utilizzate. In questo caso, la scelta sul cosiddetto \textsl{IOCTL magic number}, e sui numeri associati alle singole macro, è stata fatta evitando collisioni con le informazioni presenti nella tabella reperibile al seguente link:
 \begin{center}
 \url{https://www.kernel.org/doc/Documentation/ioctl/ioctl-number.txt}
 \end{center}
@@ -234,39 +240,39 @@ Per offrire le altre informazioni richieste come parametri non è stato seguito 
 \end{itemize}
 Poiché nel kernel Linux le funzioni registrate in \texttt{param\_array\_ops} non sono state esportate (e.g. \texttt{param\_array\_get}), non è stato possibile definire una sorta di \textsl{wrapper} che a seconda del parametro su cui si sta lavorando può assumere un comportamento differente da quello standard. Per cui, la soluzione adottata è stata quella di definire una nuova macro \texttt{mfd\_module\_param\_array\_named} nella quale si utilizzano:
 \begin{itemize}
-\item \texttt{mfd\_param\_array\_ops}, in cui è registrata la sola funzione \texttt{mfd\_param\_array\_get} che viene invocata quando si cerca di listare il contenuto dello pseudo-file corrispondente al parametro.
+\item \texttt{mfd\_param\_array\_ops}, in cui è registrata la sola funzione \texttt{mfd\_param\_array\_get} che viene invocata quando si cerca di leggere il contenuto dello pseudo-file corrispondente al parametro.
 
 Internamente, per ogni entry dell'array invoca la funzione registrata nel campo \texttt{ops->get} della struttura \texttt{kparam\_array}, passando come argomento l'indice della entry stessa e ciò permette di determinare il contenuto della corrispondente riga dello pseudo-file;
 
 \item \texttt{mfd\_param\_ops\_\#\#type}, dove nel caso specifico si ha che \texttt{\#\#type} corrisponde sempre a \texttt{charp} e anche qui è stata registrata la sola funzione \texttt{mfd\_param\_get\_charp}, che a seconda del nome del parametro:
 \begin{itemize}
-\item produce una rappresentazione in caratteri del numero di byte presenti su ciascun data stream;
-\item produce una rappresentazione in caratteri del numero di thread in attesa di dati da ciascun data stream;
+\item se uguale a: "bytes\_present\_on\_devices\_streams", produce una rappresentazione in caratteri del numero di byte presenti su ciascun data stream;
+\item se uguale a: "waiting\_threads\_on\_devices\_streams", produce una rappresentazione in caratteri del numero di thread in attesa di dati da ciascun data stream;
 \item in altri casi si comporta per default come l'originale \texttt{param\_get\_charp}.
 \end{itemize}
 Come specificato nel bullet precedente, nel campo \texttt{arg} della struttura \texttt{kernel\_param} è possibile reperire l'indice della entry per cui questa funzione sta eseguendo e questo coincide con il minor number del dispositivo, per cui si possono leggere le informazioni richieste direttamente dalla corrispondente struttura dati.
 \end{itemize}
 
 \section{Struttura del progetto}
-Di seguito è riportata un'indicazione dei file sorgenti ed header presenti all'interno della root directory del progetto.
+Di seguito è riportata un'indicazione dei file e delle cartelle presenti all'interno della root directory del progetto.
 \begin{itemize}
 \item \texttt{docs/}
 \begin{itemize}
-\item \texttt{drawio/} è la cartella contenente gli schemi costruiti su \url{https://app.diagrams.net/}.
-\item \texttt{img/} è la cartella contenente le immagini della relazione.
-\item \texttt{relazione.pdf} è il documento corrente.
+\item \texttt{drawio/} è la cartella contenente gli schemi costruiti su \url{https://app.diagrams.net/}
+\item \texttt{img/} è la cartella contenente le immagini della relazione
+\item \texttt{relazione.pdf} è il documento corrente
 \end{itemize}
 \item \texttt{include/}
 \begin{itemize}
-\item \texttt{ioctl.h} è il file header in cui sono definiti i comandi per poter eseguire richieste di I/O control.
-\item \texttt{mfd.h} è il file header in cui sono definite le macro, le strutture dati e le funzioni \textsl{inline} a supporto del modulo.
+\item \texttt{ioctl.h} è il file header in cui sono definiti i comandi per poter eseguire richieste di I/O control
+\item \texttt{mfd.h} è il file header in cui sono definite le macro, le strutture dati e le funzioni \textsl{inline} a supporto del modulo
 \end{itemize}
 \item \texttt{Makefile}
-\item \texttt{multi-flowdev.c} è il file sorgente principale per il modulo del kernel Linux che è stato sviluppato.
+\item \texttt{multi-flow-dev.c} è il file sorgente principale per il modulo del kernel Linux che è stato sviluppato
 \item \texttt{README.md}
 \item \texttt{user/}
 \begin{itemize}
-\item \texttt{device-controller.c} è un \textsl{thin client} molto semplice che può essere utilizzato per testare il funzionamento del driver.
+\item \texttt{device-controller.c} è un \textsl{thin client} molto semplice che può essere utilizzato per testare il funzionamento del driver
 \end{itemize}
 \end{itemize}
 
@@ -299,6 +305,7 @@ Posizionandosi nella root directory del progetto è possibile eseguire una o pi�
 \end{itemize}
 \end{itemize}
 
+\newpage
 Per generare il file eseguibile corrispondente al thin client è sufficiente:
 \begin{enumerate}
 \item posizionarsi all'interno della directory \texttt{user/}
