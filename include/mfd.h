@@ -90,6 +90,14 @@
         __ret;                                  \
 })
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0)
+#define mfd_module_param_call(prefix, name, ops, arg, perm, level, flags) \
+        __module_param_call(prefix, name, ops, arg, perm, level, flags)
+#else
+#define mfd_module_param_call(prefix, name, ops, arg, perm, level, flags) \
+        __module_param_call(prefix, name, ops, arg, perm, level)
+#endif
+
 /**
  * mfd_module_param_array_named - renamed parameter which is an array of some type
  * @name: a valid C identifier which is the parameter name
@@ -108,10 +116,10 @@
 	= {     .max = ARRAY_SIZE(array), .num = nump,                  \
 	        .ops = &mfd_param_ops_##type,                           \
 	        .elemsize = sizeof(array[0]), .elem = array };          \
-	__module_param_call(MODULE_PARAM_PREFIX, name,                  \
-			    &mfd_param_array_ops,                       \
-			    .arr = &__param_arr_##name,                 \
-			    perm, -1, 0);                               \
+	mfd_module_param_call(MODULE_PARAM_PREFIX, name,                \
+			      &mfd_param_array_ops,                     \
+			      .arr = &__param_arr_##name,               \
+			      perm, -1, 0);                             \
 	__MODULE_PARM_TYPE(name, "array of " #type)
 
 extern const struct kernel_param_ops mfd_param_ops_charp;
